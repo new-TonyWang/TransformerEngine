@@ -132,6 +132,7 @@ class _Linear(torch.autograd.Function):
             save_original_input,
             debug,
             enable_metis,
+            svd_grad_output_history,
         ) = non_tensor_args
 
         # NVTX label for profiling

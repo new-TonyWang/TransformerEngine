@@ -1,8 +1,9 @@
 from typing import Optional, List
 import torch
 
-from transformer_engine.pytorch.module.base import get_workspace
-from transformer_engine.pytorch.module.linear import general_gemm
+from transformer_engine.pytorch.cpp_extensions import (
+    general_gemm,
+)
 from transformer_engine.pytorch.utils import nvtx_range_push, nvtx_range_pop
 
 
@@ -48,7 +49,6 @@ class MetisSvdFunction:
         gemm_out, *_ = general_gemm(
             x,
             y,
-            get_workspace(),
             accumulate=False,
             layout=layout,
             quantization_params=output_quantizer,
@@ -83,8 +83,6 @@ class MetisSvdFunction:
 
         # for backward, input_ has already shaped into 2d tensor.
         # input_ shape [b,s,h]
-        if not input_quantizer.columnwise_usage:
-            input_quantizer.set_usage(rowwise=True, columnwise=True)
 
         input_shape = input_.shape
         if broadcast_dim >= 0:

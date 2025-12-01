@@ -1,10 +1,10 @@
 from contextlib import contextmanager
 import copy
-from dataclasses import dataclass
+from functools import cache
 
-
-@dataclass
 class LinearLowbitContext:
+    
+    # === 静态配置/成员变量 ===
     q_forward_input = "Cast2Fp4e2m1"
     q_forward_weight = "Cast2Fp4e2m1"
     q_backward_input = "Cast2Fp4e2m1"
@@ -32,51 +32,86 @@ class LinearLowbitContext:
     load_history = False
     use_metis = True
 
+    @classmethod
+    def get_params(cls):
+        """
+        核心方法：动态获取当前实例所有的成员变量名称和值。
+        过滤掉以 '_' 开头的私有属性和可调用的方法。
+        """
+        params = {}
+        # dir(self) 获取包括类属性和实例属性在内的所有属性名称
+        for name in dir(cls):
+            # 1. 过滤掉魔术方法 (__init__等) 和 私有变量 (_variable)
+            if name.startswith("_"):
+                continue
+            
+            value = getattr(cls, name)
+            
+            # 2. 过滤掉方法 (def function)，只保留数据
+            if callable(value):
+                continue
+                
+            params[name] = value
+        return params
+
+    @classmethod
+    @cache
+    def get_params_names(cls):
+        """
+        核心方法：动态获取当前实例所有的成员变量名称。
+        过滤掉以 '_' 开头的私有属性和可调用的方法。
+        """
+        params = []
+        # dir(self) 获取包括类属性和实例属性在内的所有属性名称
+        for name in dir(cls):
+            # 1. 过滤掉魔术方法 (__init__等) 和 私有变量 (_variable)
+            if name.startswith("_"):
+                continue
+            
+            value = getattr(cls, name)
+            
+            # 2. 过滤掉方法 (def function)，只保留数据
+            if callable(value):
+                continue
+                
+            params.append(name)
+        return params
+
     def __repr__(self) -> str:
-        """Pretty full-text representation of LinearLowbitContext."""
+        """
+        完全自动化的 repr，不需要手动添加新变量。
+        """
+        def fmt_val(v):
+            # 如果值是函数类对象（不太可能，但在你的原代码中有处理），返回名字
+            if callable(v):
+                return v.__name__
+            # 字符串需要显式带引号，repr() 会自动处理
+            return repr(v)
 
-        def fn_name(f):
-            return f.__name__ if callable(f) else repr(f)
+        # 获取所有参数
+        params = self.get_params()
+        
+        # 生成格式化字符串列表
+        param_strs = [f"  {k}={fmt_val(v)}" for k, v in params.items()]
+        
+        return f"{self.__class__.__name__}(\n" + ",\n".join(param_strs) + "\n)"
 
-        # schedules = ", ".join(self.schedule_list.keys())
-
-        return (
-            "LinearLowbitContext(\n"
-            f"  use_metis={self.use_metis},\n"
-            f"  q_forward_weight={fn_name(self.q_forward_weight)},\n"
-            f"  q_backward_input={fn_name(self.q_backward_input)},\n"
-            f"  q_backward_weight={fn_name(self.q_backward_weight)},\n"
-            f"  q_backward_outputgrad={fn_name(self.q_backward_outputgrad)},\n"
-            f"  activation_lowrank_niter={self.activation_lowrank_niter},\n"
-            f"  backward_lowrank_niter={self.backward_lowrank_niter},\n"
-            f"  q_scalar={self.q_scalar},\n"
-            f"  enable_activation_svd={self.enable_activation_svd},\n"
-            f"  activation_lowrank_svd={self.activation_lowrank_svd},\n"
-            f"  enable_backward_svd={self.enable_backward_svd},\n"
-            f"  backward_lowrank_svd={self.backward_lowrank_svd},\n"
-            f"  activation_broadcast_dim={self.activation_broadcast_dim},\n"
-            f"  backward_broadcast_dim={self.backward_broadcast_dim},\n"
-            f"  activation_longtail_schedule='{self.activation_longtail_schedule}',\n"
-            f"  backward_longtail_schedule='{self.backward_longtail_schedule}',\n"
-            f"  enable_lowbit={self.enable_lowbit},\n"
-            f"  forward_svd_rank={self.forward_svd_rank},\n"
-            f"  enable_weight_svd={self.enable_weight_svd}\n"
-            f"  gradacc_broadcast={self.gradacc_broadcast}\n"
-            f"  load_history={self.load_history}\n"
-            ")"
-        )
-
-    # === 新增：clone 方法 ===
     def clone(self):
-        new_obj = self.__class__()  # 创建新实例
-        for k, v in self.__dict__.items():  # 拷贝实例属性
+        """
+        使用 get_params 实现的通用 clone，或者直接使用 deepcopy
+        """
+        new_obj = self.__class__()
+        # 获取当前所有有效参数并赋值给新对象
+        for k, v in self.get_params().items():
             setattr(new_obj, k, copy.deepcopy(v))
-        # 如果类属性未实例化到 __dict__ 中，也复制它们
-        for k, v in self.__class__.__dict__.items():
-            if not k.startswith("__") and not callable(v) and k not in new_obj.__dict__:
-                setattr(new_obj, k, copy.deepcopy(v))
         return new_obj
 
+# 测试函数：获取参数
+def get_metis_context_param_names():
+    """
+    外部调用此函数获取字典格式的参数
+    """
+    return LinearLowbitContext.get_params_names()
 
 @contextmanager
 def get_metis_context(**kwargs):
@@ -107,24 +142,23 @@ def get_metis_context(**kwargs):
         for key, value in old_state.items():
             setattr(LinearLowbitContext, key, value)
 
-
 @contextmanager
+def update_context(key,value):
+    old_value = None
+    try:
+        if hasattr(LinearLowbitContext, key):
+            old_value = getattr(LinearLowbitContext, key)
+            setattr(LinearLowbitContext, key, value)
+        else:
+            raise AttributeError(f"LinearLowbitContext has no attribute '{key}'") 
+        yield
+    finally:
+        assert old_value is not None,f"LinearLowbitContext key:{key}, value should not be {old_value}"
+        setattr(LinearLowbitContext,key,old_value)
+
 def load_svd_history():
-    old_gradacc_status = LinearLowbitContext.load_history
-    LinearLowbitContext.load_history = True
-    # setattr(LinearLowbitContext, "gradacc_broadcast", True)
-    try:
-        yield
-    finally:
-        LinearLowbitContext.load_history = old_gradacc_status
+    return update_context("load_history", True)
 
-
-@contextmanager
 def no_use_metis():
-    old_use_metis_status = LinearLowbitContext.use_metis
-    LinearLowbitContext.use_metis = False
-    # setattr(LinearLowbitContext, "gradacc_broadcast", True)
-    try:
-        yield
-    finally:
-        LinearLowbitContext.use_metis = old_use_metis_status
+    return update_context("use_metis", False)
+    
