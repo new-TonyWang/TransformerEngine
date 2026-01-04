@@ -27,6 +27,7 @@ class LinearLowbitContext:
     forward_svd_rank = -1
     enable_weight_svd = False
     gradacc_broadcast = False
+    separate_residual_quantization  = True
 
     # 动态改变的参数
     load_history = False

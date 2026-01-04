@@ -135,6 +135,8 @@ class _Linear(torch.autograd.Function):
             svd_grad_output_history,
         ) = non_tensor_args
 
+        current_forward_use_metis = enable_metis and LinearLowbitContext.use_metis and LinearLowbitContext.enable_activation_svd
+
         # NVTX label for profiling
         nvtx_label = "transformer_engine._Linear.forward"
         if ub_name is not None:
@@ -187,7 +189,7 @@ class _Linear(torch.autograd.Function):
                 ), "DelayedScaling recipe is not supported with save_original_input"
         # print(f"use_metis=={use_metis},LinearLowbitContext=", LinearLowbitContext())
         if with_input_all_gather_nccl or ub_overlap_ag_fprop:  # All-gather input tensor
-
+            assert not enable_metis, "metis does not support with_input_all_gather_nccl or ub_overlap_ag_fprop" 
             # Cast local input tensor if needed
             if fp8 or debug:
                 if input_quantizer is None:
@@ -232,16 +234,14 @@ class _Linear(torch.autograd.Function):
             if fp8 or debug:
                 if isinstance(inputmat, QuantizedTensorStorage):
                     inputmat.update_usage(rowwise_usage=True)
-                elif (
-                    enable_metis
-                    and LinearLowbitContext.use_metis
-                    and LinearLowbitContext.enable_activation_svd
-                ):
+                elif (current_forward_use_metis):
                     # ------------------------------------------------------
                     # Forward x SVD
                     # Note: x = U @ S @ V
                     # ------------------------------------------------------
                     # print("foward enable_activation_svd LinearLowbitContext=", LinearLowbitContext())
+                    if input_quantizer is None:
+                        raise ValueError("Missing quantizer for input tensor")
                     inputmat = MetisSvdFunction.svd_lowrank_quant(
                         inputmat,
                         input_quantizer,

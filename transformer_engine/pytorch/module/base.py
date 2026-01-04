@@ -1215,10 +1215,13 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 else:
                     grad_bias, grad_output = tex.bgrad_quantize(grad_output, quantizer)
         if not isinstance(grad_output, QuantizedTensorStorage):
+            use_backward_svd = (
+                getattr(ctx, "enable_metis", False)
+                and getattr(getattr(ctx, "metis_context", None), "use_metis", False)
+                and getattr(getattr(ctx, "metis_context", None), "enable_backward_svd", False)
+            )
             if (
-                ctx.enable_metis
-                and ctx.metis_context.use_metis
-                and ctx.metis_context.enable_backward_svd
+                use_backward_svd
             ):
                 # print("backward use metis ,ctx.metis_context=",ctx.metis_context)
                 from .metis.quant import MetisSvdFunction
