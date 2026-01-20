@@ -19,15 +19,24 @@ class LinearLowbitContext:
     activation_lowrank_svd = -1
     enable_backward_svd = False
     backward_lowrank_svd = -1
-    activation_broadcast_dim = -1
-    backward_broadcast_dim = -1
+
     activation_longtail_schedule = "none"
     backward_longtail_schedule = "none"
     enable_lowbit = True
     forward_svd_rank = -1
     enable_weight_svd = False
     gradacc_broadcast = False
-    separate_residual_quantization  = True
+
+    # 数据拾取优化
+    separate_residual_quantization  = False
+    activation_restore_strategy = "tile"
+    activation_broadcast_dim = -1
+    activation_token_drop_rate = -1.0
+
+    backward_restore_strategy = "tile"
+    backward_broadcast_dim = -1
+    backward_token_drop_rate = -1.0
+
 
     # 动态改变的参数
     load_history = False
