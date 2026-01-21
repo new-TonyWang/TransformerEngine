@@ -25,7 +25,6 @@ class LinearLowbitContext:
     enable_lowbit = True
     forward_svd_rank = -1
     enable_weight_svd = False
-    gradacc_broadcast = False
 
     # 数据拾取优化
     separate_residual_quantization  = False
@@ -37,9 +36,14 @@ class LinearLowbitContext:
     backward_broadcast_dim = -1
     backward_token_drop_rate = -1.0
 
+    # 梯度累积优化
+    enable_gradient_accumulation_optimization = False
+    use_grad_power_iteration_svd = False
+    grad_power_iteration_time = 1
+
 
     # 动态改变的参数
-    load_history = False
+    load_history = False # 梯度累积优化和加载历史noise
     use_metis = True
 
     @classmethod

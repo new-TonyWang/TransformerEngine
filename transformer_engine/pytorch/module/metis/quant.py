@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import enum
-from typing import Optional, List
+from typing import Any, Optional, List, Union
 import torch
 
 from transformer_engine.pytorch.cpp_extensions import (
@@ -49,17 +49,18 @@ def cuda_time_call(fn, *args, **kwargs):
     elapsed = start.elapsed_time(end)
     return result, elapsed
 
-def process_and_fill_matrix(x, drop_rate = 0.8):
+def process_and_fill_matrix(x, old_noise = None, drop_rate = 0.8):
     """
     输入:
         x: 原始矩阵 (B*S, H)
+        old_noise: 历史drop out噪声矩阵
         drop_rate : 需要删除的 token 比例
     输出:
         x_compact: RestoreInfo
     """
     
     B_S, _ = x.shape
-    drop_count = int(B_S*drop_rate)
+    drop_count = int(B_S * drop_rate)
     drop_count = (drop_count // 8 ) * 8 # 保证 matmul k 轴能被 8 整除
     keep_count = B_S - drop_count
     
@@ -69,10 +70,12 @@ def process_and_fill_matrix(x, drop_rate = 0.8):
     # ==========================================
     # 获取 保留下标 (Keep) 和 删除下标 (Drop)
     # ==========================================
-    
-    # 使用噪声矩阵选取token
-    noise = torch.rand(B_S, device=x.device)
-    
+    if old_noise is None:
+        # 使用噪声矩阵选取token
+        noise = torch.rand(B_S, device=x.device)
+    else: 
+        noise = old_noise
+
     # A. 获取保留的下标 (噪声值最大的前 keep_count 个)
     _, keep_indices = torch.topk(noise, k=keep_count, dim=0, largest=True)
     keep_indices, _ = torch.sort(keep_indices, dim=0) # 保持时序
@@ -83,7 +86,7 @@ def process_and_fill_matrix(x, drop_rate = 0.8):
     
     # 提取保留的数据
     x_compact = x.index_select(0,keep_indices)
-    return x_compact, RestoreInfo(x.shape, keep_indices, drop_indices ,drop_count)
+    return x_compact, RestoreInfo(x.shape, keep_indices, drop_indices ,drop_count), noise
 
 def get_fill_values(x: torch.Tensor, restore_info: RestoreInfo, strategy) -> torch.Tensor:
     """
@@ -197,6 +200,36 @@ def restore_matrix(x: torch.Tensor, restore_info: RestoreInfo,restore_strategy, 
 
     return out
 
+def grad_power_iteration_svd(dy, v_prev:torch.Tensor, rank = 64, t_iter = 1,niter = 2,eps:float = 1e-8)->tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+    if v_prev is None:
+        u, s, v = torch.svd_lowrank(dy.to(torch.float32), q=rank, niter=niter)
+        u = u.to(dy.dtype)
+        s = s.to(dy.dtype)
+        v = v.to(dy.dtype)
+        return u,s,v
+
+    def iter_func(dy,v):
+        p = dy @ v
+        u, _ = torch.linalg.qr(p.to(torch.float32), mode = "reduced")
+        u = u.to(dy.dtype)
+        w = dy.T @ u
+        return u,w
+
+    v = v_prev
+    u = None
+    w = None
+
+    for i in range(t_iter - 1):
+        u,w = iter_func(dy,v)
+        col_norm = torch.linalg.norm(w, dim = 0, keepdim = True)
+        v = w / (col_norm + eps)
+    # last iter
+    u, w = iter_func(dy,v)
+    s:torch.Tensor = torch.linalg.norm(w, dim=0,keepdim = False)
+    v_new = w / (s.unsqueeze(0) + eps)
+
+    return u,s,v_new
+
 class MetisSvdFunction:
 
     @staticmethod
@@ -231,7 +264,7 @@ class MetisSvdFunction:
 
     @staticmethod
     @torch.no_grad()
-    @torch.compile
+    # @torch.compile
     def svd_lowrank_quant(
         input_: torch.Tensor,
         input_quantizer: "Quantizer" = None,
@@ -239,9 +272,9 @@ class MetisSvdFunction:
         niter=2,
         broadcast_dim=-1,
         is_backward=False,
-        gradacc_broadcast=False,
+        enable_gradient_accumulation_optimization=False,
         load_history=False,
-        history_list=List[Optional[torch.Tensor]],
+        history_list:dict[str,Optional[Union[torch.Tensor,List[torch.Tensor]]]] = {},
     ):
 
         # for backward, input_ has already shaped into 2d tensor.
@@ -253,8 +286,8 @@ class MetisSvdFunction:
         else:
             cinput = input_
         original_shape = cinput.shape  # [s,h]
-        if load_history and gradacc_broadcast and is_backward:
-            ker, de_svd_gemm_out = history_list
+        if load_history and enable_gradient_accumulation_optimization and is_backward:
+            ker, de_svd_gemm_out = history_list["svd_history"]
             # print("load")
         else:
             cinput = cinput.view(-1, original_shape[-1])  # [s,h] or [b*s,h]
@@ -297,10 +330,10 @@ class MetisSvdFunction:
                 de_svd_gemm_out = de_svd_gemm_out.unsqueeze(broadcast_dim)  # [1,s,h]
             else:
                 de_svd_gemm_out = de_svd_gemm_out.view(input_shape)  # [b,s,h]
-            if gradacc_broadcast and is_backward:
+            if enable_gradient_accumulation_optimization and is_backward:
                 # print("storing history_list----")
-                history_list.clear()
-                history_list.extend([ker, de_svd_gemm_out])
+                # history_list.clear()
+                history_list["svd_history"] = [ker, de_svd_gemm_out]
 
         # de_svd_gemm_out
         # ker
@@ -333,7 +366,7 @@ class MetisSvdFunction:
 
     @staticmethod
     @torch.no_grad()
-    @torch.compile
+    # @torch.compile
     def svd_lowrank_quant_separate_residual(
         input_: torch.Tensor,
         input_quantizer: "Quantizer",
@@ -342,10 +375,12 @@ class MetisSvdFunction:
         token_drop_rate: float = -1.0,
         broadcast_dim=-1,
         is_backward=False,
-        gradacc_broadcast=False,
+        enable_gradient_accumulation_optimization=False,
         load_history=False,
+        use_grad_power_iteration_svd = False,
+        grad_power_iteration_time = 1,
         keep_dim=False,
-        history_list=List[Optional[torch.Tensor]],
+        history_list:dict[str,Optional[Union[torch.Tensor,List[torch.Tensor]]]] = {},
         restore_strategy = "tile",
     ):
 
@@ -360,18 +395,31 @@ class MetisSvdFunction:
             input_ = input_.view(-1, input_.shape[-1])
 
         if token_drop_rate >=0:
-            cinput,restore_info = process_and_fill_matrix(input_, token_drop_rate)
+            #由前向记录noise，反向直接应用noise
+            if not is_backward:
+                if not load_history: # 需要计算svd的时候就记录当前的噪声
+                    cinput,restore_info, noise = process_and_fill_matrix(input_, None, token_drop_rate)
+                    history_list["token_drop_noise"] = noise
+                    # print("forward store noise")
+                else:
+                    # print("forward use old noise")
+                    old_noise = history_list["token_drop_noise"]
+                    cinput,restore_info, noise = process_and_fill_matrix(input_, old_noise, token_drop_rate)
+                    
+            else:
+                # print("backward load noise")
+                # 反向直接读取噪声
+                forward_noise = history_list.get("token_drop_noise", None)
+                cinput,restore_info, noise = process_and_fill_matrix(input_, forward_noise, token_drop_rate)
+
         elif broadcast_dim >= 0:
             cinput = input_.select(broadcast_dim, 0)  # [s,h]
-                
+
         else:
             cinput = input_
 
-        if load_history and gradacc_broadcast and is_backward:
-            ker, ug_sg,vg = history_list
-        else:
-            # print(f"cinput shape==",cinput.shape)
-            # ug, sg, vg = torch.svd(cinput.to(torch.float32)) # ug,vg are not contiguous, their transpose is contiguous.
+        def svd_lowrank_quant(cinput):
+            nonlocal input_,input_quantizer,broadcast_dim,rank,niter
             ug, sg, vg = torch.svd_lowrank(cinput.to(torch.float32), q=rank, niter=niter)
             # print("running svd")
             ug = ug.to(input_.dtype)
@@ -384,43 +432,54 @@ class MetisSvdFunction:
             ker = ug_sg @ vg.T  # [s,h] or [b*s,h]
             if broadcast_dim >= 0:
                 ker = ker.unsqueeze(broadcast_dim)  # [1,s,h]
-            else:
-                pass
-            if input_quantizer is None:
-                ug_sg = MetisSvdFunction.svd_quant_gemm(
-                sg, ug.T, input_.dtype, None, layout="NT", nvtx_label="U@S"
-            )# we use layout = NT to tell te to transpose ug. ug.T cannot work because it does not change memory layout.
-            else:
                 # ugq = input_quantizer(ug)
                 # sgq = input_quantizer(sg)
-                # 仅 量化 vg，ug_sg 在 matmul 之前量化
-                vgq = input_quantizer(vg)
-                # ug_sgq = input_quantizer(ug_sg)   
-                # ug_sg = ug_sgq
-                vg = vgq
+            # 仅 量化 vg，ug_sg 在 matmul 之前量化
+            vgq = input_quantizer(vg)
+            # ug_sgq = input_quantizer(ug_sg)   
+            # ug_sg = ug_sgq
+            vg = vgq
 
-                if False:
-                    ugq = input_quantizer(ug)
-                    sgq = input_quantizer(sg)
-                    ug_sgq = MetisSvdFunction.svd_quant_gemm(
-                        sgq, ugq, input_.dtype, None, layout="NN", nvtx_label="U@S"
-                    )
-                    dequant_input = MetisSvdFunction.svd_quant_gemm(
-                        vgq, ug_sgq, input_.dtype, None, layout="TN", nvtx_label="U@S"
-                    )
-            
-            if keep_dim:
-                ug_svd_shape = list(input_shape)
-                ug_svd_shape[-1] = rank
-                ug_sg = ug_sg.view(ug_svd_shape)
+            if False: # for debug
+                ugq = input_quantizer(ug)
+                sgq = input_quantizer(sg)
+                ug_sgq = MetisSvdFunction.svd_quant_gemm(
+                    sgq, ugq, input_.dtype, None, layout="NN", nvtx_label="U@S"
+                )
+                dequant_input = MetisSvdFunction.svd_quant_gemm(
+                    vgq, ug_sgq, input_.dtype, None, layout="TN", nvtx_label="U@S"
+                )
+            return ug_sg,vg,ker
 
-            if gradacc_broadcast and is_backward:
-                # print("storing history_list----")
-                history_list.clear()
-                history_list.extend([ker, ug_sg, sg])
+        if is_backward:
+            if use_grad_power_iteration_svd:
+                if load_history:
+                    ker, ug_sg ,vg = history_list["svd_history"]
+                else:
+                    ker, ug_sg,vg = None,None,None
+                u,s,v = grad_power_iteration_svd(cinput,vg,rank,grad_power_iteration_time,niter)
+                ug_sg = u @ torch.diag(s)
+                ker = ug_sg @ v.T
+                vg = input_quantizer(v)
+                if restore_info is not None:
+                    ker = restore_matrix(ker, restore_info, restore_strategy)
+                history_list["svd_history"] = [ker, ug_sg, v] # store bf16 data, not quanted data
+                
+            elif enable_gradient_accumulation_optimization and load_history: # only load history
+                ker, ug_sg,vg = history_list
+            else: # store and calculate svd
+                ug_sg, vg, ker = svd_lowrank_quant(cinput)
+                if restore_info is not None:
+                    ker = restore_matrix(ker, restore_info, restore_strategy)
+                if enable_gradient_accumulation_optimization:
+                    history_list["svd_history"] = [ker, ug_sg, vg]
 
-        if restore_info is not None:
-            ker = restore_matrix(ker, restore_info, restore_strategy)
+        else:
+            ug_sg, vg, ker = svd_lowrank_quant(cinput)
+
+            if restore_info is not None:
+                ker = restore_matrix(ker, restore_info, restore_strategy)
+
         if keep_dim and should_reshape:
             res = input_- ker
             res = res.view(input_shape)

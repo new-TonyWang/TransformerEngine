@@ -180,6 +180,7 @@ class _MetisLinear(torch.autograd.Function):
                 token_drop_rate=LinearLowbitContext.activation_token_drop_rate,
                 broadcast_dim=LinearLowbitContext.activation_broadcast_dim,
                 restore_strategy=LinearLowbitContext.activation_restore_strategy,
+                load_history=LinearLowbitContext.load_history, # to store noise
                 is_backward=False,
 
             )
@@ -584,6 +585,10 @@ class _MetisLinear(torch.autograd.Function):
                             niter=ctx.metis_context.backward_lowrank_niter,
                             token_drop_rate=ctx.metis_context.backward_token_drop_rate,
                             broadcast_dim=ctx.metis_context.backward_broadcast_dim,
+                            enable_gradient_accumulation_optimization=ctx.metis_context.enable_gradient_accumulation_optimization,
+                            use_grad_power_iteration_svd=ctx.metis_context.use_grad_power_iteration_svd,
+                            load_history = ctx.metis_context.load_history,
+                            history_list = ctx.svd_grad_output_history,
                             is_backward=True,
 
                         )

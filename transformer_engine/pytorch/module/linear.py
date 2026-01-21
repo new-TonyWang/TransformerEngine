@@ -1144,7 +1144,7 @@ class Linear(TransformerEngineBaseModule):
         self.enable_metis = enable_metis
 
         self.wgrad_store = WeightGradStore(delay_wgrad_compute, ub_bulk_wgrad)
-        self.svd_grad_output_history = []
+        self.svd_grad_output_history = {}
 
         if device == "meta":
             assert parameters_split is None, "Cannot split module parameters on 'meta' device."
