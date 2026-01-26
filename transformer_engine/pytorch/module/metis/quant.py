@@ -279,7 +279,7 @@ class MetisSvdFunction:
 
         # for backward, input_ has already shaped into 2d tensor.
         # input_ shape [b,s,h]
-
+        input_quantizer.set_usage(rowwise=True, columnwise=True)
         input_shape = input_.shape
         if broadcast_dim >= 0:
             cinput = input_.select(broadcast_dim, 0)  # [s,h]
@@ -390,9 +390,11 @@ class MetisSvdFunction:
         input_shape = input_.shape
         should_reshape = False
         restore_info=None
-        if len(input_shape) > 2:
+
+        if broadcast_dim < 0 and len(input_shape) > 2:
             should_reshape = True
             input_ = input_.view(-1, input_.shape[-1])
+
 
         if token_drop_rate >=0:
             #由前向记录noise，反向直接应用noise

@@ -185,15 +185,15 @@ class _MetisLinear(torch.autograd.Function):
 
             )
             own_quantized_input = True
-        if fp8:
-            if save_original_input:
-                # No need for column-wise data since this
-                # tensor will not be cached for backward pass
-                input_quantizer.set_usage(columnwise=False)
-                own_quantized_input = False
-            inputmat = input_quantizer(inputmat)
-        else:
-            inputmat_total = inputmat
+        # if fp8:
+        #     if save_original_input:
+        #         # No need for column-wise data since this
+        #         # tensor will not be cached for backward pass
+        #         input_quantizer.set_usage(columnwise=False)
+        #         own_quantized_input = False
+        #     inputmat = input_quantizer(inputmat)
+        # else:
+        #     inputmat_total = inputmat
 
         if is_cpu_offload_enabled():
             start_offload(input_ug_sg, input_vg, input_res)

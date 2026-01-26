@@ -4,26 +4,30 @@ from functools import cache
 
 class LinearLowbitContext:
     
-    # === 静态配置/成员变量 ===
+    # === 伪量化配置 ===
     q_forward_input = "Cast2Fp4e2m1"
     q_forward_weight = "Cast2Fp4e2m1"
     q_backward_input = "Cast2Fp4e2m1"
     q_backward_weight = "Cast2Fp4e2m1"
     q_backward_outputgrad = "Cast2Fp4e2m1"
+    q_scalar = 1.0
+    activation_longtail_schedule = "none"
+    backward_longtail_schedule = "none"
 
     # SVD & low-rank 配置
     activation_lowrank_niter = 2
     backward_lowrank_niter = 2
-    q_scalar = 1.0
+
     enable_activation_svd = False
     activation_lowrank_svd = -1
+
     enable_backward_svd = False
     backward_lowrank_svd = -1
 
-    activation_longtail_schedule = "none"
-    backward_longtail_schedule = "none"
+
+    forward_svd_rank = -1 # 权重拆分时权重的low_rank 数值
+    forward_svd_warmup_steps = -1 # 权重拆分之前预热次数
     enable_lowbit = True
-    forward_svd_rank = -1
     enable_weight_svd = False
 
     # 数据拾取优化

@@ -1455,12 +1455,21 @@ class Linear(TransformerEngineBaseModule):
                 grad_output_quantizer,
             ) = quantizers
 
-            if is_grad_enabled:
-                linear_fn = _Linear.apply
-                autograd_ctx = []
-            else:
-                linear_fn = _Linear.forward
-                autograd_ctx = [None]
+            if self.enable_metis and LinearLowbitContext.use_metis and LinearLowbitContext.separate_residual_quantization:
+                from .metis import _MetisLinear
+                if is_grad_enabled:
+                    linear_fn = _MetisLinear.apply
+                    autograd_ctx = []
+                else:
+                    linear_fn = _MetisLinear.forward
+                    autograd_ctx = [None]
+            else:    
+                if is_grad_enabled:
+                    linear_fn = _Linear.apply
+                    autograd_ctx = []
+                else:
+                    linear_fn = _Linear.forward
+                    autograd_ctx = [None]
 
             non_tensor_args = (
                 is_first_microbatch,
