@@ -3,7 +3,7 @@
 # See LICENSE for license information.
 
 """Linear API"""
-from typing import Callable, Dict, Optional, Tuple, Union, List
+from typing import Any, Callable, Dict, Optional, Tuple, Union, List
 from functools import reduce
 from operator import mul as multiply_op
 import warnings
@@ -75,6 +75,8 @@ from ..cpu_offload import (
     mark_activation_offload,
 )
 from ...debug.pytorch.debug_state import TEDebugState
+from .metis.quant import MetisSvdFunction
+from .metis.metis_context import LinearLowbitContext
 
 __all__ = ["Linear"]
 
@@ -92,6 +94,7 @@ class _Linear(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         non_tensor_args: Tuple,
     ) -> torch.Tensor:
+        # print("foward LinearLowbitContext=", LinearLowbitContext())
         # pylint: disable=missing-function-docstring
 
         (
@@ -128,7 +131,11 @@ class _Linear(torch.autograd.Function):
             symmetric_ar_type,
             save_original_input,
             debug,
+            enable_metis,
+            svd_grad_output_history,
         ) = non_tensor_args
+
+        current_forward_use_metis = enable_metis and LinearLowbitContext.use_metis and LinearLowbitContext.enable_activation_svd
 
         # NVTX label for profiling
         nvtx_label = "transformer_engine._Linear.forward"
@@ -180,9 +187,9 @@ class _Linear(torch.autograd.Function):
                 assert not isinstance(
                     input_quantizer, Float8Quantizer
                 ), "DelayedScaling recipe is not supported with save_original_input"
-
+        # print(f"use_metis=={use_metis},LinearLowbitContext=", LinearLowbitContext())
         if with_input_all_gather_nccl or ub_overlap_ag_fprop:  # All-gather input tensor
-
+            assert not enable_metis, "metis does not support with_input_all_gather_nccl or ub_overlap_ag_fprop" 
             # Cast local input tensor if needed
             if fp8 or debug:
                 if input_quantizer is None:
@@ -227,14 +234,31 @@ class _Linear(torch.autograd.Function):
             if fp8 or debug:
                 if isinstance(inputmat, QuantizedTensorStorage):
                     inputmat.update_usage(rowwise_usage=True)
-                else:
+                elif (current_forward_use_metis):
+                    # ------------------------------------------------------
+                    # Forward x SVD
+                    # Note: x = U @ S @ V
+                    # ------------------------------------------------------
+                    # print("foward enable_activation_svd LinearLowbitContext=", LinearLowbitContext())
                     if input_quantizer is None:
                         raise ValueError("Missing quantizer for input tensor")
-                    input_quantizer.set_usage(
-                        rowwise=True, columnwise=backward_needs_input and not save_original_input
+                    inputmat = MetisSvdFunction.svd_lowrank_quant(
+                        inputmat,
+                        input_quantizer,
+                        rank=LinearLowbitContext.activation_lowrank_svd,
+                        niter=LinearLowbitContext.activation_lowrank_niter,
+                        broadcast_dim=LinearLowbitContext.activation_broadcast_dim,
+                        is_backward=False,
                     )
-                    inputmat = input_quantizer(inputmat)
                     own_quantized_input = True
+                # else:
+                if input_quantizer is None:
+                    raise ValueError("Missing quantizer for input tensor")
+                input_quantizer.set_usage(
+                    rowwise=True, columnwise=backward_needs_input and not save_original_input
+                )
+                inputmat = input_quantizer(inputmat)
+                own_quantized_input = True
             else:
                 inputmat = cast_if_needed(inp, activation_dtype)  # Cast for AMP
             inputmat_total = inputmat
@@ -320,6 +344,7 @@ class _Linear(torch.autograd.Function):
         # Forward GEMM
         # Note: y = x * w^T
         # ------------------------------------------------------
+        # print(f"forward weightmat dtype= {type(weightmat)}, inputmat_total dtype= {type(inputmat_total)}")
         nvtx_range_push(f"{nvtx_label}.gemm")
         gemm_out, *_, reduce_scatter_out = general_gemm(
             weightmat,
@@ -476,7 +501,6 @@ class _Linear(torch.autograd.Function):
             ctx.requires_dgrad = inp.requires_grad
             ctx.requires_wgrad = weight.requires_grad
             ctx.reduce_and_update_bwd_fp8_tensors = False
-
             ctx.owns_input = saved_inputmat is not inp
             if ctx.fp8 and requires_grad(inp, weight, bias):
                 _first_fp8_module = FP8GlobalStateManager.IS_FIRST_FP8_MODULE
@@ -485,6 +509,10 @@ class _Linear(torch.autograd.Function):
                     FP8GlobalStateManager.IS_FIRST_FP8_MODULE = _first_fp8_module
             ctx.wgrad_store = wgrad_store
 
+            # Load metis lowbit context
+            ctx.enable_metis = enable_metis
+            ctx.metis_context = LinearLowbitContext().clone()
+            ctx.svd_grad_output_history = svd_grad_output_history
         # ------------------------------------------------------
         # Cached state for backward pass is ready...
         # ------------------------------------------------------
@@ -493,6 +521,7 @@ class _Linear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
+        # print("backward LinearLowbitContext=", ctx.metis_context)
         # pylint: disable=missing-function-docstring
 
         # NVTX label for profiling
@@ -595,7 +624,7 @@ class _Linear(torch.autograd.Function):
                 and ctx.grad_output_quantizer is not None
             ):
                 ctx.grad_output_quantizer.set_usage(columnwise=False)
-
+            # print("backward  ctx.use_metis=", ctx.use_metis)
             # Prepare grad output tensor
             nvtx_range_push(f"{nvtx_label}.grad_output_preprocess")
             (
@@ -717,7 +746,7 @@ class _Linear(torch.autograd.Function):
 
                 # dgrad GEMM
                 # Note: dx = dy * w
-
+                # print(f"backward weight_fp8 dtype= {type(weight_fp8)}, grad_output dtype= {type(grad_output)}")
                 nvtx_range_push(f"{nvtx_label}.dgrad_gemm")
                 gemm_out, *_, reduce_scatter_out = general_gemm(
                     weight_fp8,
@@ -1096,6 +1125,7 @@ class Linear(TransformerEngineBaseModule):
         symmetric_ar_type: Optional[str] = None,
         save_original_input: bool = False,
         name: Optional[str] = None,
+        enable_metis: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1111,8 +1141,10 @@ class Linear(TransformerEngineBaseModule):
         self.symmetric_ar_type = symmetric_ar_type
         self.save_original_input = save_original_input
         self.name = name
+        self.enable_metis = enable_metis
 
         self.wgrad_store = WeightGradStore(delay_wgrad_compute, ub_bulk_wgrad)
+        self.svd_grad_output_history = {}
 
         if device == "meta":
             assert parameters_split is None, "Cannot split module parameters on 'meta' device."
@@ -1423,12 +1455,21 @@ class Linear(TransformerEngineBaseModule):
                 grad_output_quantizer,
             ) = quantizers
 
-            if is_grad_enabled:
-                linear_fn = _Linear.apply
-                autograd_ctx = []
-            else:
-                linear_fn = _Linear.forward
-                autograd_ctx = [None]
+            if self.enable_metis and LinearLowbitContext.use_metis and LinearLowbitContext.separate_residual_quantization:
+                from .metis import _MetisLinear
+                if is_grad_enabled:
+                    linear_fn = _MetisLinear.apply
+                    autograd_ctx = []
+                else:
+                    linear_fn = _MetisLinear.forward
+                    autograd_ctx = [None]
+            else:    
+                if is_grad_enabled:
+                    linear_fn = _Linear.apply
+                    autograd_ctx = []
+                else:
+                    linear_fn = _Linear.forward
+                    autograd_ctx = [None]
 
             non_tensor_args = (
                 is_first_microbatch,
@@ -1464,6 +1505,8 @@ class Linear(TransformerEngineBaseModule):
                 self.symmetric_ar_type,
                 self.save_original_input,
                 debug,
+                self.enable_metis,
+                self.svd_grad_output_history,
             )
             out = linear_fn(
                 *autograd_ctx,

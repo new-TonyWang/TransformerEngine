@@ -706,7 +706,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
     def set_meta_tensor(self, fwd: bool, recipe: Recipe) -> None:
         """Init scales and amaxes for fwd | bwd."""
         fp8_meta_tensor_key = "scaling_fwd" if fwd else "scaling_bwd"
-
+        # print("current recipe is:", recipe)
         # Return early if recipe state matches recipe
         if self.fp8_meta_tensors_initialized:
             recipe_state = self.fp8_meta[fp8_meta_tensor_key]
@@ -1108,6 +1108,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             R2: bias gradient on R1.
 
         """
+        grad_output_shape = grad_output.shape
         grad_output = grad_output.reshape((-1, grad_output.shape[-1]))
         grad_output = grad_output.contiguous()
         gather_grad_output = row_parallel_mode and ctx.sequence_parallel
@@ -1143,7 +1144,29 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                         Float8BlockwiseQTensorStorage,
                     ),
                 ):
-                    grad_output = quantizer(grad_output)
+                    if (
+                        ctx.enable_metis
+                        and ctx.metis_context.use_metis
+                        and ctx.metis_context.enable_backward_svd
+                    ):
+                        # print("backward use metis ")
+                        from .metis.quant import MetisSvdFunction
+
+                        if ctx.metis_context.backward_lowrank_svd > 0:
+                            grad_output = MetisSvdFunction.svd_lowrank_quant_grad_output(
+                                grad_output,
+                                grad_output_shape=grad_output_shape,
+                                input_quantizer=quantizer,
+                                rank=ctx.metis_context.backward_lowrank_svd,
+                                niter=ctx.metis_context.backward_lowrank_niter,
+                                broadcast_dim=ctx.metis_context.backward_broadcast_dim,
+                            )
+                        else:
+                            grad_output = MetisSvdFunction.svd_fullrank_quant(
+                                grad_output, quantizer
+                            )
+                    else:
+                        grad_output = quantizer(grad_output)
 
                 # Copy into communication buffer, and replace original gradient with it
                 grad_output, _ = fill_userbuffers_buffer_for_all_gather(
@@ -1173,6 +1196,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         # FP8 without all-gather: fused bgrad + cast + transpose
         grad_bias = None
+        # print("backward use_bias==",ctx.use_bias)
         if ctx.use_bias:
             if isinstance(
                 grad_output,
@@ -1191,6 +1215,32 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 else:
                     grad_bias, grad_output = tex.bgrad_quantize(grad_output, quantizer)
         if not isinstance(grad_output, QuantizedTensorStorage):
+            use_backward_svd = (
+                getattr(ctx, "enable_metis", False)
+                and getattr(getattr(ctx, "metis_context", None), "use_metis", False)
+                and getattr(getattr(ctx, "metis_context", None), "enable_backward_svd", False)
+            )
+            if (
+                use_backward_svd
+            ):
+                # print("backward use metis ,ctx.metis_context=",ctx.metis_context)
+                from .metis.quant import MetisSvdFunction
+
+                if ctx.metis_context.backward_lowrank_svd > 0:
+                    grad_output = MetisSvdFunction.svd_lowrank_quant_grad_output(
+                        grad_output,
+                        grad_output_shape=grad_output_shape,
+                        input_quantizer=quantizer,
+                        rank=ctx.metis_context.backward_lowrank_svd,
+                        niter=ctx.metis_context.backward_lowrank_niter,
+                        broadcast_dim=ctx.metis_context.backward_broadcast_dim,
+                        gradacc_broadcast=ctx.metis_context.gradacc_broadcast,
+                        load_history=ctx.metis_context.load_history,
+                        is_backward=True,
+                        history_list=ctx.svd_grad_output_history,
+                    )
+                else:
+                    grad_output = MetisSvdFunction.svd_fullrank_quant(grad_output, quantizer)
             grad_output = quantizer(grad_output)
         return grad_output, grad_bias
 
