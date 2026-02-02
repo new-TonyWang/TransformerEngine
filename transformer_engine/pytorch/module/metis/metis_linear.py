@@ -78,10 +78,11 @@ class DecomposedLinear(torch.nn.Module):
 
         self.decompose_weight()
 
+    @torch.no_grad()
     def decompose_weight(self):
         from transformer_engine.pytorch.module.linear import Linear  # avoid circular import
         rank = self.forward_svd_rank
-        s_tensor = torch.empty(
+        s_tensor = torch.zeros(
             rank if rank > 0 else self.out_features,
             device=self.device,
             dtype=self.params_dtype,
@@ -92,6 +93,7 @@ class DecomposedLinear(torch.nn.Module):
                 self.in_features,
                 self.out_features,
                 enable_metis = True,
+                init_method=partial(init_tensor_with_data,torch.zeros(self.out_features,self.in_features,device=self.device,dtype = self.params_dtype)),
                 bias=self.use_bias,
                 **self.te_linear_args,
             )
@@ -109,19 +111,22 @@ class DecomposedLinear(torch.nn.Module):
             v_weight_shape[1],
             bias=False,
             enable_metis=self.enable_lowbit,
+            init_method=partial(init_tensor_with_data,torch.zeros(v_weight_shape[1],v_weight_shape[0],device=self.device,dtype = self.params_dtype)),
             **self.te_linear_args,
         )
         self.ulinear = Linear(
             u_weight_shape[0],
             u_weight_shape[1],
             bias=False,
+            init_method=partial(init_tensor_with_data,torch.zeros(u_weight_shape[1],u_weight_shape[0],device=self.device,dtype = self.params_dtype)),
             **self.te_linear_args,
         )
         self.register_parameter(
-            "s",
+            "eigenvalue",
             torch.nn.Parameter(s_tensor),
         )
 
+    @torch.no_grad()
     def initialize_weight_svd_decomposition_from_tensor(self, weight_param: torch.Tensor, bias_param: Optional[torch.Tensor]):
 
         weight = weight_param.detach()
@@ -143,7 +148,7 @@ class DecomposedLinear(torch.nn.Module):
                 @ v[:rank]
                 )
             # only low rank need linear_residual
-            self.linear_residual.weight.data.copy_(linear_residual_weight)
+            self.linear_residual.weight.data.copy_(linear_residual_weight.detach())
             # device=device
             if bias is not None:
                 self.linear_residual.bias.data.copy_(bias)
@@ -157,9 +162,17 @@ class DecomposedLinear(torch.nn.Module):
             v_weight_data = v
             u_weight_data = u
 
-        self.ulinear.weight.data.copy_(u_weight_data)
-        self.vlinear.weight.data.copy_(v_weight_data)
-        self.s.data.copy_(s_data)
+        self.ulinear.weight.data.detach().copy_(u_weight_data.detach())
+        self.vlinear.weight.data.detach().copy_(v_weight_data.detach())
+        self.eigenvalue.data.detach().copy_(s_data.detach())
+        
+        # mix precision optimizer
+        if hasattr(self.ulinear.weight,"main_param"):
+            self.ulinear.weight.main_param.detach().copy_(u_weight_data.detach().float())
+        if hasattr(self.vlinear.weight,"main_param"):
+            self.vlinear.weight.main_param.detach().copy_(v_weight_data.detach().float())
+        if hasattr(self.eigenvalue,"main_param"):
+            self.eigenvalue.main_param.detach().copy_(s_data.detach().float())
 
         self.weight_svd_has_initialized = True
 
@@ -179,8 +192,7 @@ class DecomposedLinear(torch.nn.Module):
     @torch.no_grad()
     def update_weight_svd_decomposition(self):
         assert self.weight_svd_has_initialized
-        print("updating weight svd decomposition ")
-        weight_fp32 = (self.ulinear.weight @ torch.diag(self.s) @ self.vlinear.weight).float()
+        weight_fp32 = (self.ulinear.weight @ torch.diag(self.eigenvalue) @ self.vlinear.weight).float()
         u,s,v = self._svd_decompose_weight_fp32(weight_fp32)
         rank = self.forward_svd_rank
         if rank > 0:
@@ -194,14 +206,22 @@ class DecomposedLinear(torch.nn.Module):
             u_weight_data = u
             s_data = s
 
-        self.ulinear.weight.data.copy_(u_weight_data)
-        self.vlinear.weight.copy_(v_weight_data)
-        self.s.data.copy_(s_data)
+        self.ulinear.weight.data.detach().copy_(u_weight_data)
+        self.vlinear.weight.data.detach().copy_(v_weight_data)
+        self.eigenvalue.data.detach().copy_(s_data)
+
+        # mix precision optimizer
+        if hasattr(self.ulinear.weight,"main_param"):
+            self.ulinear.weight.main_param.detach().copy_(u_weight_data.detach().float())
+        if hasattr(self.vlinear.weight,"main_param"):
+            self.vlinear.weight.main_param.detach().copy_(v_weight_data.detach().float())
+        if hasattr(self.eigenvalue,"main_param"):
+            self.eigenvalue.main_param.detach().copy_(s_data.detach().float())
 
     def forward(self, inp: torch.Tensor, **kvargs) -> torch.Tensor:
         # TODO optimize vlinear inp quant and linear_residual inp quant, they share the same input, or merge them into one linear
         y = self.vlinear(inp, **kvargs)
-        y = torch.mul(self.s, y)
+        # y = torch.mul(self.eigenvalue, y)
         y = self.ulinear(y, **kvargs)
         y_0 = self.linear_residual(inp, **kvargs)
         y = y + y_0
@@ -239,11 +259,11 @@ class DecomposedLinear(torch.nn.Module):
             
             # s (Singular Values)
             # s 是 Parameter，直接打印数据太长，我们打印形状和类型
-            if isinstance(self.s, torch.nn.Parameter):
-                s_info = f"Parameter(shape={tuple(self.s.shape)}, dtype={self.s.dtype})"
+            if isinstance(self.eigenvalue, torch.nn.Parameter):
+                s_info = f"Parameter(shape={tuple(self.eigenvalue.shape)}, dtype={self.eigenvalue.dtype})"
             else:
-                s_info = str(self.s) # Fallback if it's Identity
-            child_lines.append(f"(s): {s_info}")
+                s_info = str(self.eigenvalue) # Fallback if it's Identity
+            child_lines.append(f"(eigenvalue): {s_info}")
 
             # linear_residual (仅在 rank > 0 时存在有效值)
             if self.forward_svd_rank > 0:
@@ -438,15 +458,7 @@ class MetisLinear(torch.nn.Module):
         if self.enable_weight_svd:
             #  using svd to decompose linear_residual later
             self.weight_svd_decomposition_model = DecomposedLinear(in_features,out_features,te_linear_args = self.commonMetisSvdFunction_args)
-
-        # debugpy.breakpoint()
-        if LinearLowbitContext.enable_weight_svd:
-            if LinearLowbitContext.forward_svd_warmup_steps <= 0:
-            # no need to warmup original_linear, directly decomposition linear_residual
-                self.weight_svd_decomposition()
-            else:
-            # need to warmup original_linear, off load to cpu when warming up original_linear
-                self.weight_svd_decomposition_model.to("cpu")
+            self.weight_svd_decomposition_model.to("cpu")
 
     @staticmethod
     @torch.no_grad()
@@ -571,8 +583,8 @@ class MetisLinear(torch.nn.Module):
             
             # s (奇异值向量)
             # 注意：s 是 Parameter，直接取 .grad
-            if isinstance(model.s, torch.nn.Parameter):
-                grads['s_grad'] = model.s.grad
+            if isinstance(model.eigenvalue, torch.nn.Parameter):
+                grads['s_grad'] = model.eigenvalue.grad
             
             # --- 可选组件: Residual & Bias ---
             # 如果 rank > 0，linear_residual 会参与计算
