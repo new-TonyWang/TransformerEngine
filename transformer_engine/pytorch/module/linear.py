@@ -76,7 +76,8 @@ from ..cpu_offload import (
 )
 from ...debug.pytorch.debug_state import TEDebugState
 from .metis.quant import MetisSvdFunction
-from .metis.metis_context import LinearLowbitContext
+from .metis.metis_context import LinearLowbitContext, QuantizationStrategy
+from transformer_engine.pytorch.module.metis.utils import TensorOffloadManager
 
 __all__ = ["Linear"]
 
@@ -1144,7 +1145,7 @@ class Linear(TransformerEngineBaseModule):
         self.enable_metis = enable_metis
 
         self.wgrad_store = WeightGradStore(delay_wgrad_compute, ub_bulk_wgrad)
-        self.svd_grad_output_history = {}
+        self.metis_tensor_history = TensorOffloadManager()
 
         if device == "meta":
             assert parameters_split is None, "Cannot split module parameters on 'meta' device."
@@ -1455,7 +1456,7 @@ class Linear(TransformerEngineBaseModule):
                 grad_output_quantizer,
             ) = quantizers
 
-            if self.enable_metis and LinearLowbitContext.use_metis and LinearLowbitContext.separate_residual_quantization:
+            if self.enable_metis and LinearLowbitContext.use_metis and LinearLowbitContext.quantization_strategy != QuantizationStrategy.BASE:
                 from .metis import _MetisLinear
                 if is_grad_enabled:
                     linear_fn = _MetisLinear.apply
@@ -1506,7 +1507,7 @@ class Linear(TransformerEngineBaseModule):
                 self.save_original_input,
                 debug,
                 self.enable_metis,
-                self.svd_grad_output_history,
+                self.metis_tensor_history,
             )
             out = linear_fn(
                 *autograd_ctx,

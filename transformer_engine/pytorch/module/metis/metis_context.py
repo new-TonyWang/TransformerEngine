@@ -1,6 +1,27 @@
 from contextlib import contextmanager
 import copy
 from functools import cache
+from enum import Enum
+
+
+class QuantizationStrategy(Enum):
+    """量化策略枚举"""
+    BASE = "base"
+    SEPARATE_RESIDUAL = "separate_residual"
+    MEAN_CONCAT = "mean_concat"
+    MEAN = "mean"
+    
+    @classmethod
+    def from_string(cls, value):
+        """从字符串转换为枚举值"""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            for strategy in cls:
+                if strategy.value == value:
+                    return strategy
+            raise ValueError(f"Invalid quantization strategy: {value}. Valid options: {[s.value for s in cls]}")
+        raise TypeError(f"Expected str or QuantizationStrategy, got {type(value)}")
 
 class LinearLowbitContext:
     
@@ -30,8 +51,10 @@ class LinearLowbitContext:
     enable_lowbit = True
     enable_weight_svd = False
 
+    # metis 量化策略
+    quantization_strategy = QuantizationStrategy.BASE
+
     # 数据拾取优化
-    separate_residual_quantization  = False
     activation_restore_strategy = "tile"
     activation_broadcast_dim = -1
     activation_token_drop_rate = -1.0
@@ -44,11 +67,19 @@ class LinearLowbitContext:
     enable_gradient_accumulation_optimization = False
     use_grad_power_iteration_svd = False
     grad_power_iteration_time = 1
+    
+    # 前向幂迭代SVD优化
+    use_power_iteration_svd = False
+    power_iteration_time = 1
+    enable_history_optimization = False
 
 
     # 动态改变的参数
     load_history = False # 梯度累积优化和加载历史noise
     use_metis = True
+
+    # tp 并行相关配置
+    tp_strategy = "allgather"
 
     @classmethod
     def get_params(cls):
@@ -135,11 +166,14 @@ def get_metis_context_param_names():
 def get_metis_context(**kwargs):
     """
     用于临时修改 LinearLowbitContext 全局配置的上下文管理器。
-    进入时按 kwargs 修改，退出时自动恢复。
+    进入时按 kwargs 修改,退出时自动恢复。
 
     示例：
         with get_metis_context(q_scalar=0.5, enable_lowbit=False):
             # 临时使用低比特关闭配置
+            ...
+        with get_metis_context(quantization_strategy="separate_residual"):
+            # 使用 separate_residual 量化策略
             ...
     """
     old_state = {}
@@ -149,6 +183,9 @@ def get_metis_context(**kwargs):
         for key, value in kwargs.items():
             if hasattr(LinearLowbitContext, key):
                 old_state[key] = getattr(LinearLowbitContext, key)
+                # 特殊处理 quantization_strategy: 字符串转枚举
+                if key == "quantization_strategy" and isinstance(value, str):
+                    value = QuantizationStrategy.from_string(value)
                 setattr(LinearLowbitContext, key, value)
             else:
                 raise AttributeError(f"LinearLowbitContext has no attribute '{key}'")
@@ -166,6 +203,9 @@ def update_context(key,value):
     try:
         if hasattr(LinearLowbitContext, key):
             old_value = getattr(LinearLowbitContext, key)
+            # 特殊处理 quantization_strategy: 字符串转枚举
+            if key == "quantization_strategy" and isinstance(value, str):
+                value = QuantizationStrategy.from_string(value)
             setattr(LinearLowbitContext, key, value)
         else:
             raise AttributeError(f"LinearLowbitContext has no attribute '{key}'") 

@@ -20,6 +20,7 @@ from ..base import (
 from ...quantization import FP8GlobalStateManager
 from ...utils import (
     cast_if_needed,
+    clear_tensor_data,
     requires_grad,
     needs_quantized_gemm,
     assert_dim_for_fp8_exec,
@@ -50,8 +51,21 @@ from ...cpu_offload import (
     mark_not_offload,
     mark_activation_offload,
 )
-from .quant import MetisSvdFunction
-from .metis_context import LinearLowbitContext
+from .quant import MetisSvdFunction, MetisMeanFunction
+from .metis_context import LinearLowbitContext, QuantizationStrategy
+from ...distributed import (
+    set_tensor_model_parallel_attributes,
+    get_distributed_world_size,
+    allreduce,
+    symmetric_all_reduce,
+    reduce_scatter_along_first_dim,
+    gather_along_first_dim,
+    is_fp8_activation_recompute_enabled,
+    in_fp8_activation_recompute_phase,
+    _fsdp_scatter_tensors,
+    _fsdp_gather_tensors,
+)
+
 
 __all__ = ["_MetisLinear"]
 
@@ -123,6 +137,8 @@ class _MetisLinear(torch.autograd.Function):
         out_features, in_features = weight.shape
         assert inp.shape[-1] == in_features, "GEMM not possible"
 
+        inputmat = inp  # Input tensor to save for backward (maybe sharded)
+
         # Configure tensor-parallel communication
         tp_world_size = get_distributed_world_size(tp_group)
         backward_needs_input = is_grad_enabled and weight.requires_grad
@@ -152,7 +168,7 @@ class _MetisLinear(torch.autograd.Function):
         # Note: Cast to expected dtype and perform tensor-parallel communication
         # ------------------------------------------------------
         nvtx_range_push(f"{nvtx_label}.input_cast_comm")
-        inputmat = inp  # Input tensor to save for backward (maybe sharded)
+        inputmat = inp
         inputmat_total = None  # Input tensor to pass to GEMM (gathered)
         own_quantized_input = False
         if fp8:
@@ -163,10 +179,8 @@ class _MetisLinear(torch.autograd.Function):
                     input_quantizer, Float8Quantizer
                 ), "DelayedScaling recipe is not supported with save_original_input"
         # print(f"use_metis=={use_metis},LinearLowbitContext=", LinearLowbitContext())
-        input_ug_sg, input_vg, input_res = None, None, None
-        if isinstance(inputmat, QuantizedTensorStorage):
-            inputmat.update_usage(rowwise_usage=True)
-        elif current_forward_use_metis and fp8:
+        input_ug_sg, input_vg, input_res, input_restore_info = None, None, None, None
+        if current_forward_use_metis and fp8 and LinearLowbitContext.quantization_strategy == QuantizationStrategy.SEPARATE_RESIDUAL:
             # ------------------------------------------------------
             # Forward x SVD
             # ------------------------------------------------------
@@ -182,9 +196,22 @@ class _MetisLinear(torch.autograd.Function):
                 restore_strategy=LinearLowbitContext.activation_restore_strategy,
                 load_history=LinearLowbitContext.load_history, # to store noise
                 is_backward=False,
-
+                use_power_iteration_svd=LinearLowbitContext.use_power_iteration_svd,
+                power_iteration_time=LinearLowbitContext.power_iteration_time,
+                enable_history_optimization=LinearLowbitContext.enable_history_optimization,
+                tp_size=tp_size,
+                tp_group=tp_group,
+                tp_strategy=LinearLowbitContext.tp_strategy,
+                parallel_mode=parallel_mode,
             )
-            own_quantized_input = True
+        elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN_CONCAT:
+            mean_concat_quant_result = MetisMeanFunction.mean_concat_quant(inputmat, input_quantizer)
+        elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN:
+            mean_quant_result = MetisMeanFunction.mean_quant(inputmat, input_quantizer)
+        else:
+            raise ValueError("Unsupported quantization strategy " + LinearLowbitContext.quantization_strategy)
+        
+        own_quantized_input = True
         # if fp8:
         #     if save_original_input:
         #         # No need for column-wise data since this
@@ -271,19 +298,7 @@ class _MetisLinear(torch.autograd.Function):
         # ------------------------------------------------------
         # print(f"forward weightmat dtype= {type(weightmat)}, inputmat_total dtype= {type(inputmat_total)}")
         nvtx_range_push(f"{nvtx_label}.gemm")
-        if not current_forward_use_metis:
-            gemm_out, *_, reduce_scatter_out = general_gemm(
-                weightmat,
-                inputmat_total,
-                quantization_params=output_quantizer,
-                out_dtype=activation_dtype,
-                bias=bias,
-                use_split_accumulator=use_split_accumulator,
-                ub=ub_obj,
-                ub_type=ub_type,
-                extra_output=reduce_scatter_out,
-            )
-        else:
+        if LinearLowbitContext.quantization_strategy == QuantizationStrategy.SEPARATE_RESIDUAL:
             output_shape = list(inp.shape)
             output_shape[-1] = weightmat.shape[0]
             gemm_out, _ = MetisSvdFunction.gemm_with_separate_residual(
@@ -298,6 +313,12 @@ class _MetisLinear(torch.autograd.Function):
                 restore_info = input_restore_info,
                 restore_strategy=LinearLowbitContext.activation_restore_strategy,
             )
+        elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN_CONCAT:
+            gemm_out = MetisMeanFunction.compute_weight_gradient_with_mean_concat_quant(mean_concat_quant_result, weightmat, activation_dtype, None)
+        elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN:
+            gemm_out = MetisMeanFunction.gemm_operation_with_mean_quant(mean_quant_result, weightmat, activation_dtype, None)
+        else:
+            raise ValueError("Unsupported quantization strategy " + LinearLowbitContext.quantization_strategy)
         nvtx_range_pop(f"{nvtx_label}.gemm")
         # ------------------------------------------------------
         # Finished forward GEMM...
@@ -314,22 +335,25 @@ class _MetisLinear(torch.autograd.Function):
         # Prepare output tensor
         # Note: Perform tensor-parallel communication
         # ------------------------------------------------------
-        # out = None
-        # if ub_overlap_rs_fprop:
-        #     out = reduce_scatter_out
-        # elif parallel_mode == "row" and tp_size > 1:
-        #     nvtx_range_push(f"{nvtx_label}.row_parallel_comm")
-        #     out = gemm_out
-        #     if sequence_parallel:
-        #         out, _ = reduce_scatter_along_first_dim(out, tp_group)
-        #     elif tensor_parallel:
-        #         if symmetric_ar_type is not None:
-        #             out, _ = symmetric_all_reduce(out, tp_group, all_reduce_type=symmetric_ar_type)
-        #         else:
-        #             out, _ = allreduce(out, tp_group)
-        #     nvtx_range_pop(f"{nvtx_label}.row_parallel_comm")
-        # else:
-        out = gemm_out
+        out = None
+        if ub_overlap_rs_fprop:
+            raise ValueError("metis does not support sp with ub_overlap_rs_fprop")
+            # out = reduce_scatter_out
+        elif parallel_mode == "row" and tp_size > 1 and not sequence_parallel:
+            nvtx_range_push(f"{nvtx_label}.row_parallel_comm")
+            out = gemm_out
+            if sequence_parallel:
+                out, _ = reduce_scatter_along_first_dim(out, tp_group)
+            elif tensor_parallel:
+                # metis split tp
+                # out,_ = reduce_scatter_along_first_dim(out,tp_group)
+                if symmetric_ar_type is not None:
+                    out, _ = symmetric_all_reduce(out, tp_group, all_reduce_type=symmetric_ar_type)
+                else:
+                    out, _ = allreduce(out, tp_group) 
+            nvtx_range_pop(f"{nvtx_label}.row_parallel_comm")
+        else:
+            out = gemm_out
         # ------------------------------------------------------
         # Output tensor is ready to return...
         # ------------------------------------------------------
@@ -387,17 +411,35 @@ class _MetisLinear(torch.autograd.Function):
 
             mark_not_offload(weight, weightmat, bias)
             # TODO(ksivamani): Check memory usage
-            tensors_to_save, tensor_objects = prepare_for_saving(
-                input_ug_sg,
-                input_vg,
-                input_res,
-                weightmat,
-                weight,
-                bias,
-            )
+            if LinearLowbitContext.quantization_strategy == QuantizationStrategy.SEPARATE_RESIDUAL:
+                tensors_to_save, tensor_objects = prepare_for_saving(
+                    input_ug_sg,
+                    input_vg,
+                    input_res,
+                    weightmat,
+                    weight,
+                    bias,
+                )
+            elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN_CONCAT:
+                tensors_to_save, tensor_objects = prepare_for_saving(
+                    mean_concat_quant_result.quant_concat,
+                    weightmat,
+                    weight,
+                    bias,
+                )    
+            elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN:
+                tensors_to_save, tensor_objects = prepare_for_saving(
+                    mean_quant_result.quant_input,
+                    mean_quant_result.quant_mean,
+                    weightmat,
+                    weight,
+                    bias,
+                )   
+            else:
+                raise ValueError("Unsupported quantization strategy " + LinearLowbitContext.quantization_strategy)
+
             ctx.save_for_backward(*tensors_to_save)
             ctx.tensor_objects = tensor_objects
-
             ctx.activation_dtype = activation_dtype
             ctx.fp8 = fp8
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
@@ -465,18 +507,42 @@ class _MetisLinear(torch.autograd.Function):
             nvtx_label = f"{nvtx_label}.{ctx.ub_name}"
 
         with get_nvtx_range_context("_Linear_backward"):
-            saved_tensors = ctx.saved_tensors
-            (
-                input_ug_sg,
-                input_vg,
-                input_res,
-                weight_fp8,
-                weight,
-                bias,
-            ) = restore_from_saved(  # pylint: disable=unbalanced-tuple-unpacking
-                ctx.tensor_objects, saved_tensors
-            )
-
+            if ctx.metis_context.quantization_strategy == QuantizationStrategy.SEPARATE_RESIDUAL:
+                saved_tensors = ctx.saved_tensors
+                (
+                    input_ug_sg,
+                    input_vg,
+                    input_res,
+                    weight_fp8,
+                    weight,
+                    bias,
+                ) = restore_from_saved(  # pylint: disable=unbalanced-tuple-unpacking
+                    ctx.tensor_objects, saved_tensors
+                )
+            elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_CONCAT:
+                saved_tensors = ctx.saved_tensors
+                (
+                    quant_concat,
+                    weight_fp8,
+                    weight,
+                    bias,
+                ) = restore_from_saved(  # pylint: disable=unbalanced-tuple-unpacking
+                    ctx.tensor_objects, saved_tensors
+                ) 
+            elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN:
+                saved_tensors = ctx.saved_tensors
+                (
+                    quant_input,
+                    quant_mean,
+                    weight_fp8,
+                    weight,
+                    bias,
+                ) = restore_from_saved(  # pylint: disable=unbalanced-tuple-unpacking
+                    ctx.tensor_objects, saved_tensors
+                )
+                
+            else:
+                raise ValueError("Unsupported quantization strategy " + ctx.metis_context.quantization_strategy)
             # Delete the references to tensor objects once they've been consumed
             # by the `restore_from_saved` method to construct back the actual tensors.
             ctx.tensor_objects = None
@@ -575,7 +641,7 @@ class _MetisLinear(torch.autograd.Function):
             #     ctx.grad_output_quantizer,
             # )
             if ctx.enable_metis and ctx.metis_context.use_metis and ctx.metis_context.enable_backward_svd:
-                if ctx.metis_context.backward_lowrank_svd > 0:
+                if ctx.metis_context.backward_lowrank_svd > 0 and ctx.metis_context.quantization_strategy == QuantizationStrategy.SEPARATE_RESIDUAL:
                     grad_output_shape = grad_output.shape
                     output_grad_ug_sg, output_grad_vg, output_grad_res,output_grad_restore_info = (
                         MetisSvdFunction.svd_lowrank_quant_separate_residual(
@@ -586,13 +652,24 @@ class _MetisLinear(torch.autograd.Function):
                             token_drop_rate=ctx.metis_context.backward_token_drop_rate,
                             broadcast_dim=ctx.metis_context.backward_broadcast_dim,
                             enable_gradient_accumulation_optimization=ctx.metis_context.enable_gradient_accumulation_optimization,
-                            use_grad_power_iteration_svd=ctx.metis_context.use_grad_power_iteration_svd,
+                            use_power_iteration_svd=ctx.metis_context.use_grad_power_iteration_svd,
+                            power_iteration_time=ctx.metis_context.grad_power_iteration_time,
                             load_history = ctx.metis_context.load_history,
                             history_list = ctx.svd_grad_output_history,
                             is_backward=True,
+                            tp_size=ctx.tp_size,
+                            tp_group=ctx.tp_group,
+                            tp_strategy=ctx.metis_context.tp_strategy,
+                            parallel_mode=ctx.parallel_mode,
 
                         )
                     )
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_CONCAT:
+                    grad_output_mean_concat_quant_result = MetisMeanFunction.mean_concat_quant(grad_output, ctx.grad_output_quantizer,)
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN:
+                    grad_output_mean_quant_result = MetisMeanFunction.mean_quant(grad_output, ctx.grad_output_quantizer,)
+                else:
+                    raise ValueError("Unsupported quantization strategy " + ctx.metis_context.quantization_strategy)
             nvtx_range_pop(f"{nvtx_label}.grad_output_preprocess")
 
             # --------------------------------------------------
@@ -652,7 +729,7 @@ class _MetisLinear(torch.autograd.Function):
                 # Note: dx = dy * w
                 # print(f"backward weight_fp8 dtype= {type(weight_fp8)}, grad_output dtype= {type(grad_output)}")
                 nvtx_range_push(f"{nvtx_label}.dgrad_gemm")
-                if ctx.enable_metis and ctx.metis_context.use_metis and ctx.metis_context.enable_backward_svd:
+                if ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_CONCAT:
                     gemm_out, _ = MetisSvdFunction.gemm_with_separate_residual(
                         output_grad_ug_sg,
                         output_grad_vg,
@@ -665,18 +742,12 @@ class _MetisLinear(torch.autograd.Function):
                         restore_info=output_grad_restore_info,
                         restore_strategy=ctx.metis_context.backward_restore_strategy
                     )
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_CONCAT:
+                    gemm_out = MetisMeanFunction.mean_concat_quant(grad_output, input_quantizer)
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN:
+                    gemm_out = MetisMeanFunction.compute_input_gradient_mean(grad_output_mean_quant_result,weight_fp8,ctx.activation_dtype,None,)
                 else:
-                    gemm_out, *_, reduce_scatter_out = general_gemm(
-                        weight_fp8,
-                        grad_output,
-                        layout="NN",
-                        grad=True,
-                        quantization_params=ctx.grad_input_quantizer,
-                        out=gemm_out,
-                        out_dtype=ctx.activation_dtype,
-                        use_split_accumulator=use_split_accumulator,
-                        bulk_overlap=ctx.ub_bulk_dgrad,
-                    )
+                    raise ValueError("Unsupported quantization strategy " + ctx.metis_context.quantization_strategy)
                 nvtx_range_pop(f"{nvtx_label}.dgrad_gemm")
 
                 # Prepare grad input tensor
@@ -685,20 +756,20 @@ class _MetisLinear(torch.autograd.Function):
                 #     dgrad = reduce_scatter_out
                 # elif ctx.ub_bulk_wgrad:
                 #     dgrad = ub_obj_wgrad.get_buffer(local_chunk=True)
-                # elif ctx.parallel_mode == "column" and ctx.tp_size > 1:
-                #     nvtx_range_push(f"{nvtx_label}.column_parallel_comm_dgrad")
-                #     dgrad = gemm_out
-                #     if ctx.sequence_parallel:
-                #         dgrad, dgrad_work = reduce_scatter_along_first_dim(
-                #             dgrad,
-                #             ctx.tp_group,
-                #             async_op=True,
-                #         )
-                #     else:
-                #         dgrad, dgrad_work = allreduce(dgrad, ctx.tp_group, async_op=True)
-                #     nvtx_range_pop(f"{nvtx_label}.column_parallel_comm_dgrad")
-                # else:
-                dgrad = gemm_out
+                if ctx.parallel_mode == "column" and ctx.tp_size > 1:
+                    nvtx_range_push(f"{nvtx_label}.column_parallel_comm_dgrad")
+                    dgrad = gemm_out
+                    if ctx.sequence_parallel:
+                        dgrad, dgrad_work = reduce_scatter_along_first_dim(
+                            dgrad,
+                            ctx.tp_group,
+                            async_op=True,
+                        )
+                    else:
+                        dgrad, dgrad_work = allreduce(dgrad, ctx.tp_group, async_op=True)
+                    nvtx_range_pop(f"{nvtx_label}.column_parallel_comm_dgrad")
+                else:
+                    dgrad = gemm_out
 
             # --------------------------------------------------
             # Grad input tensor has been computed...
@@ -851,16 +922,16 @@ class _MetisLinear(torch.autograd.Function):
                 #         grad_bias = grad_bias_
                 #     del grad_bias_
 
-                #     # Deallocate tensors if permitted
-                #     if ctx.owns_input:
-                #         # Input tensor is internal
-                #         clear_tensor_data(inputmat_total)
-                #     elif ctx.backward_input_needs_gather:
-                #         # Gathered input tensor is internal
-                #         clear_tensor_data(inputmat_total)
-                #     if ctx.parallel_mode == "row" and ctx.sequence_parallel:
-                #         # Gathered grad output tensor is internal
-                #         clear_tensor_data(grad_output)
+                    # Deallocate tensors if permitted
+                    # if ctx.owns_input:
+                    #     # Input tensor is internal
+                    #     clear_tensor_data(inputmat_total)
+                    # elif ctx.backward_input_needs_gather:
+                    #     # Gathered input tensor is internal
+                    #     clear_tensor_data(inputmat_total)
+                    if ctx.parallel_mode == "row" and ctx.sequence_parallel:
+                        # Gathered grad output tensor is internal
+                        clear_tensor_data(grad_output)
 
                 # # Update grad input if overlapping reduce-scatter with wgrad GEMM
                 # if ctx.ub_bulk_wgrad:
@@ -868,7 +939,7 @@ class _MetisLinear(torch.autograd.Function):
                 #         dgrad = reduce_scatter_out
                 #     else:
                 #         dgrad = ub_obj_wgrad.get_buffer(local_chunk=True).clone()
-                if ctx.enable_metis and ctx.metis_context.use_metis and ctx.metis_context.enable_backward_svd:
+                if ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_CONCAT:
                     wgrad = MetisSvdFunction.gemm_with_weight_grad_separate_residual(
                         input_ug_sg,
                         input_vg,
@@ -884,6 +955,12 @@ class _MetisLinear(torch.autograd.Function):
                         grad_restoreinfo=output_grad_restore_info,
                         restore_strategy=ctx.metis_context.backward_restore_strategy,
                     )
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_CONCAT:
+                    wgrad = MetisMeanFunction.compute_weight_gradient_with_mean_concat(grad_output, ctx.grad_output_quantizer,)
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN:
+                    wgrad = MetisMeanFunction.compute_weight_gradient_mean(quant_input,quant_mean,grad_output_mean_quant_result,ctx.activation_dtype,ctx.grad_weight_quantizer)
+                else:
+                    raise ValueError("Unsupported quantization strategy " + ctx.metis_context.quantization_strategy)
                     # wgrad = ctx.grad_weight_quantizer(wgrad)
             # --------------------------------------------------
             # Grad weight has been computed...
