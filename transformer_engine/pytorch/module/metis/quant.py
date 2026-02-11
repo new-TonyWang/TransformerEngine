@@ -11,7 +11,9 @@ from transformer_engine.pytorch.utils import nvtx_range_push, nvtx_range_pop
 from transformer_engine.pytorch.constants import TE_DType
 import transformer_engine.pytorch as te
 import transformer_engine_torch as tex
-
+from ...utils import (
+    clear_tensor_data,
+)
 from .utils import TensorOffloadManager
 from ...distributed import (
     set_tensor_model_parallel_attributes,
@@ -1078,20 +1080,72 @@ class MetisSvdFunction:
 @dataclass
 class MeanQuantResult:
     """封装mean_quant的输出结果"""
-    quant_input: torch.Tensor  # 量化后的输入，shape [b*s, h]
-    quant_mean: torch.Tensor   # 量化后的均值，shape [b, h]
+    quant_input: QuantizedTensorStorage  # 量化后的输入，shape [b*s, h]
+    quant_mean: QuantizedTensorStorage   # 量化后的均值，shape [b, h]
     shape: tuple         # 原始输入形状，例如 (b, s, h)
 
+    def prepare_for_saving(self):
+        quant_input_tensors,_ = self.quant_input.prepare_for_saving()
+        quant_mean_tensors,_ = self.quant_mean.prepare_for_saving()
+        tensors = []
+        tensors.extend(quant_input_tensors)
+        tensors.extend(quant_mean_tensors)
+        return tensors, self
+
+    def restore_from_saved(
+        self, tensors: list[Optional[torch.Tensor]]
+    ) -> list[Optional[torch.Tensor]]:
+        """Restore the tensor base data from the saved tensors list."""
+        tensors = self.quant_input.restore_from_saved(tensors)
+        tensors = self.quant_mean.restore_from_saved(tensors)
+        return tensors
+
+    def clear(self):
+        self.quant_input.clear()
+        self.quant_mean.clear()
+
 @dataclass
-class MeanConcatQuantResult:
+class MeanSplitDimQuantResult:
     """封装mean_concat_quant的输出结果"""
-    quant_concat: torch.Tensor  # 量化后的拼接张量，shape [b*(s+1), h]
-    quant_concat_reverse: torch.Tensor = None   # 量化后的拼接张量，shape [b*(s+1), h]
+    quant_input: QuantizedTensorStorage  # 量化后的拼接张量，shape [b*s, h]
+    input_tensor_mean_dim0: torch.Tensor = None   # 量化后的拼接张量，shape [b*s, h]
+    input_tensor_mean_dim1: torch.Tensor = None   # 量化后的拼接张量，shape [b*s, h]
     shape: tuple = tuple()         # 原始拼接形状，例如 (b, s, h)
+    cached_quant_mean_tensor: QuantizedTensorStorage = None # warning: only for saving and loading, besure to manual set to None when not needed and
+
+    def prepare_for_saving(self):
+        quant_input_tensors,_ = self.quant_input.prepare_for_saving()
+        tensors = quant_input_tensors
+        tensors.extend([self.input_tensor_mean_dim0, self.input_tensor_mean_dim1])
+        self.input_tensor_mean_dim0 = None
+        self.input_tensor_mean_dim1 = None
+        # warning: cached_quant_mean_tensor only set to None here, besure to manual
+        self.cached_quant_mean_tensor = None
+        return tensors, self
+
+    def restore_from_saved(
+        self, tensors: list[Optional[torch.Tensor]]
+    ) -> list[Optional[torch.Tensor]]:
+        """Restore the tensor base data from the saved tensors list."""
+        tensors = self.quant_input.restore_from_saved(tensors)
+        self.input_tensor_mean_dim0 = tensors[0]
+        self.input_tensor_mean_dim1 = tensors[1]
+        return tensors[2:]
+    
+    def get_quant_mean_tensor(self):
+        '''Get the quantized mean tensor. '''
+        if self.cached_quant_mean_tensor is not None:
+            return self.cached_quant_mean_tensor
+        return self.quant_input._quantizer(self.input_tensor_mean_dim0 * self.input_tensor_mean_dim1)
+
+    def clear(self):
+        clear_tensor_data(self.quant_input,self.input_tensor_mean_dim0,self.input_tensor_mean_dim1,self.cached_quant_mean_tensor)
+        self.shape = None
 
 class MetisMeanFunction:
     @staticmethod
-    def mean_concat_quant(input_tensor: torch.Tensor, quantizer: "Quantizer"):
+    @torch.no_grad()
+    def mean_split_dim_quant(input_tensor: torch.Tensor, quantizer: "Quantizer"):
         """
         对输入tensor计算均值并拼接后进行量化，返回2D张量
         
@@ -1100,31 +1154,36 @@ class MetisMeanFunction:
             quantizer: 量化器，必须是1D量化器
             
         Returns:
-            MeanConcatQuantResult: 包含量化后的2D张量和原始形状信息
+            MeanSplitDimQuantResult: 包含量化后的2D张量和原始形状信息
         """
         # 保存原始形状
-        original_shape = input_tensor.shape  # (b, s, h)
-        hidden_size = original_shape[-1]
+        input_shape = input_tensor.shape  # (b, s, h)
+        hidden_size = input_shape[-1]
         
         # 转换为2D张量
-        input_concat_2d = input_tensor.view(-1, hidden_size)  # shape: [b*s, h]
-
-        # 计算沿着序列维度的均值
-        x = input_concat_2d.mean(dim=0, keepdim=True)  # shape: [1, h]
+        input_tensor_2d = input_tensor.view(-1, hidden_size)  # shape: [b*s, h]
+        input_tensor_mean_dim0 = input_tensor_2d.mean(dim=0, keepdim=False).expand_as(input_tensor_2d)  # shape: [b, 1, h]        
+        input_tensor_mean_dim1 = input_tensor_2d.mean(dim=1, keepdim=True).expand_as(input_tensor_2d)
+        # input_tensor_mean = input_tensor_mean_dim1 * input_tensor_mean_dim0
+        # x_2d = input_tensor_2d.view(-1, hidden_size)  # shape: [b, h]
         
-        # 拼接原始输入和均值
-        input_concat = torch.cat([input_concat_2d, x], dim=0)  # shape: [b*s+1, h]
-
-        # 使用量化器进行量化（要求是1D量化）
-        quant_input_concat = quantizer(input_concat)
+        # 分别进行量化
+        # must pad to [8,hidden]
+        # pad_amount=15
+        # quant_mean = F.pad(input_tensor_mean, (0, 0, 0, pad_amount), mode='constant', value=0)
+        # quant_tensor_mean = quantizer(input_tensor_mean)
+        quant_x = quantizer(input_tensor_2d)
         
         # 返回包装结果
-        return MeanConcatQuantResult(
-            quant_concat=quant_input_concat,
-            shape=original_shape
+        return MeanSplitDimQuantResult(
+            quant_input=quant_x,
+            input_tensor_mean_dim0=input_tensor_mean_dim0,
+            input_tensor_mean_dim1=input_tensor_mean_dim1,
+            shape=input_shape
         )
     
     @staticmethod
+    @torch.no_grad()
     def mean_quant(input_tensor: torch.Tensor, quantizer: "Quantizer"):
         """
         分别对输入tensor和均值进行量化，返回2D张量
@@ -1162,7 +1221,7 @@ class MetisMeanFunction:
         )
     
     @staticmethod
-    def gemm_operation_with_mean_quant(quant_result: MeanQuantResult, weight: torch.Tensor, 
+    def gemm_operation_with_mean_quant(quant_result: Union[MeanQuantResult,MeanSplitDimQuantResult], weight: torch.Tensor, 
                                        activation_dtype: torch.dtype = None, 
                                        quantizer: "Quantizer" = None):
         """
@@ -1179,10 +1238,13 @@ class MetisMeanFunction:
         Returns:
             out_final: 最终输出，根据input_shape和weight shape推断输出形状
         """
-        print("running gemm_operation_with_mean_quant ")
+        # print("running gemm_operation_with_mean_quant ")
         # 从quant_result中提取数据
         quant_input = quant_result.quant_input  # [b*s, h]
-        quant_mean = quant_result.quant_mean    # [b, h]
+        if isinstance(quant_result, MeanSplitDimQuantResult):
+            quant_mean = quant_result.get_quant_mean_tensor()
+        else:
+            quant_mean = quant_result.quant_mean    # [b, h]
         input_shape = quant_result.shape  # (b, s, h) or (b,h)
 
         output_shape = list(input_shape)
@@ -1216,56 +1278,9 @@ class MetisMeanFunction:
         out_final = out_final.view(output_shape)  # [b, s, out_features]
         
         return out_final
-
-    @staticmethod
-    def gemm_operation_with_mean_concat_quant(quant_result: MeanQuantResult, weight: torch.Tensor, 
-                                       activation_dtype: torch.dtype = None, 
-                                       quantizer: "Quantizer" = None):
-        """
-        基于mean_quant输出的GEMM操作：out_final = out_0 - out_1
-        其中 out_0 = quant_input @ weight.T
-              out_1 = quant_mean @ weight.T
-        
-        Args:
-            quant_result: MeanConcatQuantResult对象，包含量化张量和形状信息
-            weight: 权重矩阵，shape为[out_features, h]
-            activation_dtype: 激活数据类型
-            quantizer: 量化器
-            
-        Returns:
-            out_final: 最终输出，根据input_shape和weight shape推断输出形状
-        """
-        # 从quant_result中提取数据
-        quant_input = quant_result.quant_concat  # [b*s+1, h]
-        input_shape = quant_result.shape  # (b, s, h)
-
-        output_shape = list(input_shape)
-        output_shape[-1] = weight.shape[0]
-
-        # 从形状信息推断维度
-        # batch_size = input_shape[0]
-        # seq_len = input_shape[1]
-        # out_features = weight.shape[0]
-        
-        # 使用TE的GEMM接口计算out_0: [b*s+1, h] @ [h, out_features]^T -> [b*s+1, out_features]
-        output_all = MetisSvdFunction.svd_quant_gemm(
-            weight, quant_input, activation_dtype, 
-            quantizer, layout="TN", nvtx_label="input@weight"
-        )  # [b*s+1, out_features]
-        out_0 = output_all[:-1, :] # 除了最后一个 [b*s, out_features]
-        out_1 = output_all[-1, :] # 最后一个 [1, out_features]
-        # 根据input_shape推断输出形状并重塑
-        # output_shape = (batch_size, seq_len, out_features)
-        
-        # 计算最终输出：out_final = out_0 - out_1
-        out_final = out_0 - out_1  # [b, s, out_features]
-
-        out_final = out_final.view(output_shape)  # [b, s, out_features]
-        
-        return out_final
     
     @staticmethod
-    def compute_input_gradient_mean(grad_output_result: Union[MeanQuantResult, MeanConcatQuantResult], weight: torch.Tensor, 
+    def compute_input_gradient_mean(grad_output_result: Union[MeanQuantResult, MeanSplitDimQuantResult], weight: torch.Tensor, 
                               activation_dtype: torch.dtype = None, 
                               quantizer: "Quantizer" = None):
         """
@@ -1280,47 +1295,34 @@ class MetisMeanFunction:
         Returns:
             dx: 输入梯度，shape为[b, s, h]
         """
-        if isinstance(grad_output_result, MeanConcatQuantResult):
-            quant_input = grad_output_result.quant_concat  # [b*s+1, out_features]
-            # Split into input and mean parts
-            input_shape = list(grad_output_result.shape)
-            hidden_size = weight.shape[1]
-            input_shape[-1] = hidden_size
-            
-            # 计算输入梯度：dx = dout @ weight
-            dx_all = MetisSvdFunction.svd_quant_gemm(
-                quant_input, weight, activation_dtype, 
-                quantizer, layout="NN", grad=True, nvtx_label="dout@weight"
-            )  # [b*s+1, h]
-            
-            dx = dx_all[:-1, :]  # [b*s, h]
-            dx_mean = dx_all[-1, :]  # [1, h]
-            
-            dx_final = dx - dx_mean  # [b*s, h]
-            dx_final = dx_final.view(input_shape)  # [b, s, h]
+        if isinstance(grad_output_result, MeanSplitDimQuantResult):
+            quant_mean = grad_output_result.get_quant_mean_tensor()
             
         elif isinstance(grad_output_result, MeanQuantResult):
             quant_mean = grad_output_result.quant_mean
-            quant_input = grad_output_result.quant_input
+        else:
+            raise ValueError("Unsupported quantization result type")
 
-            input_shape = list(grad_output_result.shape)
-            hidden_size = weight.shape[1]
-            input_shape[-1] = hidden_size
-            
-            # 计算输入梯度：dx = dout @ weight
-            dx = MetisSvdFunction.svd_quant_gemm(
-                weight, quant_input, activation_dtype, 
-                quantizer, layout="NN", grad=True, nvtx_label="dout@weight"
-            )  # [b*s, h]
+        quant_input = grad_output_result.quant_input
 
-            dx_mean = MetisSvdFunction.svd_quant_gemm(
-                weight,quant_mean, activation_dtype, 
-                quantizer, layout="NN", grad=True, nvtx_label="dout@weight"
-            )  # [1, h]
-            # dx_mean = dx_mean[0,:]
-            # dx_mean = dx_mean.unsqueeze(0)
-            dx_final = dx - dx_mean  # [b, s, h]
-            dx_final = dx_final.view(input_shape)
+        input_shape = list(grad_output_result.shape)
+        hidden_size = weight.shape[1]
+        input_shape[-1] = hidden_size
+        
+        # 计算输入梯度：dx = dout @ weight
+        dx = MetisSvdFunction.svd_quant_gemm(
+            weight, quant_input, activation_dtype, 
+            quantizer, layout="NN", grad=True, nvtx_label="dout@weight"
+        )  # [b*s, h]
+
+        dx_mean = MetisSvdFunction.svd_quant_gemm(
+            weight,quant_mean, activation_dtype, 
+            quantizer, layout="NN", grad=True, nvtx_label="dout@weight"
+        )  # [1, h]
+        # dx_mean = dx_mean[0,:]
+        # dx_mean = dx_mean.unsqueeze(0)
+        dx_final = dx - dx_mean  # [b, s, h]
+        dx_final = dx_final.view(input_shape)
 
         return dx_final
 
@@ -1365,9 +1367,10 @@ class MetisMeanFunction:
         return dx_final
     
     @staticmethod
-    def compute_weight_gradient_mean(x_quant_input:torch.Tensor,x_quant_mean:torch.Tensor, dy_quant: MeanQuantResult,
-                               activation_dtype: torch.dtype = None, 
-                               quantizer: "Quantizer" = None):
+    def compute_weight_gradient_mean(x_quant:Union[MeanQuantResult, MeanSplitDimQuantResult],
+                                     dy_quant: Union[MeanQuantResult, MeanSplitDimQuantResult],
+                                     activation_dtype: torch.dtype = None, 
+                                     quantizer: "Quantizer" = None):
         """
         计算权重梯度：
                     dw = dy.T @ x
@@ -1383,13 +1386,21 @@ class MetisMeanFunction:
             dw: 权重梯度，shape为[out_features, h]
         """
         # 从x_quant中提取输入数据
-        # x_quant_input = x_quant.quant_input  # [b*s, h]
-        # x_quant_mean = x_quant.quant_mean    # [b, h]
+        if isinstance(x_quant, MeanSplitDimQuantResult):
+            x_quant_input = x_quant.quant_input
+            x_quant_mean = x_quant.get_quant_mean_tensor()
+        else:
+            x_quant_input = x_quant.quant_input  # [b*s, h]
+            x_quant_mean = x_quant.quant_mean    # [b, h]
         # x_shape = x_quant.shape  # (b, s, h)
         
         # 从dy_quant中提取梯度数据
-        dy_quant_input = dy_quant.quant_input  # [b*s, out_features]
-        dy_quant_mean = dy_quant.quant_mean    # [b, out_features]
+        if isinstance(dy_quant, MeanSplitDimQuantResult):
+            dy_quant_input = dy_quant.quant_input
+            dy_quant_mean = dy_quant.get_quant_mean_tensor()
+        else:
+            dy_quant_input = dy_quant.quant_input  # [b*s, out_features]
+            dy_quant_mean = dy_quant.quant_mean    # [b, out_features]
         # dy_shape = dy_quant.shape  # (b, s, out_features)
         
         # 根据公式计算四项：
@@ -1433,19 +1444,19 @@ class MetisMeanFunction:
         return dw
     
     @staticmethod
-    def compute_weight_gradient_with_mean_concat(x_quant: MeanConcatQuantResult, dy_quant: MeanConcatQuantResult,
+    def compute_weight_gradient_with_mean_concat(x_quant: MeanSplitDimQuantResult, dy_quant: MeanSplitDimQuantResult,
                                                        activation_dtype: torch.dtype = None, 
                                                        quantizer: "Quantizer" = None):
         """
         基于mean_concat_quant计算权重梯度
         
             dw = dy.T @ x
-                = ([dy,dy_mean]).T @ (x - x_mean)
+                = (dy - dy_mean).T @ (x - x_mean)
                 = (dy.T @ x) - (dy.T @ x_mean) - (dy_mean.T @ x) + (dy_mean.T @ x_mean)
 
             let dy_expand_0 = [dy, dy_mean]
                 dy_expand_1 = [dy, -dy_mean]
-            let x_expand_0 = [x, dx_mean]
+            let x_expand_0 = [x, x_mean]
                 x_expand_1 = [-x_mean, x]
             
             dw_0 = dy_expand_0.T @ x_expand_0

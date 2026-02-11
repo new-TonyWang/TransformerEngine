@@ -8,7 +8,7 @@ class QuantizationStrategy(Enum):
     """量化策略枚举"""
     BASE = "base"
     SEPARATE_RESIDUAL = "separate_residual"
-    MEAN_CONCAT = "mean_concat"
+    MEAN_SPLIT_DIM = "mean_split_dim"
     MEAN = "mean"
     
     @classmethod
