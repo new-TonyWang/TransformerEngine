@@ -5,6 +5,7 @@ import torch
 
 from transformer_engine.pytorch.cpp_extensions import (
     general_gemm,
+    general_grouped_gemm,
 )
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensorStorage
 from transformer_engine.pytorch.utils import nvtx_range_push, nvtx_range_pop
@@ -28,6 +29,27 @@ from ...distributed import (
     _fsdp_gather_tensors,
 )
 import torch.nn.functional as F
+
+
+def _get_tensor_device(t) -> torch.device:
+    """Safely get device from a regular tensor or QuantizedTensorStorage.
+
+    QuantizedTensorStorage sub-classes (e.g., NVFP4TensorStorage) do not
+    expose a .device attribute directly, but their internal scale/data
+    tensors are plain torch.Tensors that do.
+    """
+    if hasattr(t, 'device'):
+        return t.device
+    for attr in ('_rowwise_scale_inv', '_columnwise_scale_inv',
+                 '_rowwise_data', '_columnwise_data'):
+        sub = getattr(t, attr, None)
+        if sub is not None and hasattr(sub, 'device'):
+            return sub.device
+    raise RuntimeError(
+        f"Cannot determine device from tensor of type {type(t)}"
+    )
+
+
 def schedule_none(input_: torch.Tensor):
     return input_, 1.0
 
@@ -1077,6 +1099,469 @@ class MetisSvdFunction:
                 dw = term1 + term2 + term3 + term4
             return dw
 
+    @staticmethod
+    def _gemm_out_shape(A, B, layout):
+        """Compute output tensor shape for GEMM with given layout (row-major convention).
+
+        For row-major PyTorch tensors mapped to CUBLAS column-major:
+          "NN": result = (B.size(0), A.size(1)),  inner dim: A.size(0) == B.size(1)
+          "NT": result = (B.size(1), A.size(1)),  inner dim: A.size(0) == B.size(0)
+          "TN": result = (B.size(0), A.size(0)),  inner dim: A.size(1) == B.size(1)
+        """
+        if layout == "NN":
+            return (B.size(0), A.size(1))
+        elif layout == "NT":
+            return (B.size(1), A.size(1))
+        elif layout == "TN":
+            return (B.size(0), A.size(0))
+        raise ValueError(f"Unsupported GEMM layout: {layout}")
+
+    @staticmethod
+    @torch.no_grad()
+    def grouped_gemm_with_separate_residual(
+        u_s_list,
+        v_list,
+        res_list,
+        weight_list,
+        activation_dtype,
+        quantizer_list,
+        m_splits,
+        is_grad=False,
+        restore_info_list=None,
+        restore_strategy="tile",
+    ):
+        """Grouped GEMM with separate residual for multiple expert splits.
+
+        Batches per-split SVD GEMM operations across all active splits using
+        general_grouped_gemm, replacing N individual gemm_with_separate_residual calls.
+
+        Forward:  y_i = (u_s_i @ v_i.T + res_i) @ w_i.T
+        Backward: dx_i = (u_s_i @ v_i.T + res_i) @ w_i
+
+        The computation is decomposed into 3 sequential grouped GEMM steps:
+          Step 1 (layout[0]): vw_i  = v_i OP w_i
+          Step 2 (layout[1]): uvw_i = vw_i OP u_s_i
+          Step 3 (layout[2]): rw_i  = w_i OP res_i
+          Output: uvw_i (+ restore if needed) + rw_i
+
+        Args:
+            u_s_list:          List[Tensor] U@S matrices, shape [m_i, rank] per split.
+            v_list:            List[Tensor] V matrices (already quantized), per split.
+            res_list:          List[Tensor] residuals (already quantized), per split.
+            weight_list:       List[Tensor] weight matrices (already quantized), per split.
+            activation_dtype:  Output dtype (e.g. torch.bfloat16).
+            quantizer_list:    List[Optional[Quantizer]] per-split quantizer.
+            m_splits:          List[int] token counts per split.
+            is_grad:           True for backward dgrad pass, False for forward.
+            restore_info_list: Optional list of RestoreInfo for token-drop restoration.
+            restore_strategy:  Strategy string for restore_matrix.
+
+        Returns:
+            List of output tensors, one per split (empty tensor for zero splits).
+        """
+        N = len(m_splits)
+        device = _get_tensor_device(weight_list[0])
+
+        # Layout triplet: [step1, step2, step3]
+        if is_grad:
+            layout_list = ["NT", "TN", "NN"]
+        else:
+            layout_list = ["NN", "TN", "TN"]
+
+        # Collect indices of non-empty splits
+        active = [i for i in range(N) if m_splits[i] > 0]
+
+        if not active:
+            out_dim = lambda i: weight_list[i].size(1) if is_grad else weight_list[i].size(0)
+            return [
+                torch.empty(0, out_dim(i), dtype=activation_dtype, device=device)
+                for i in range(N)
+            ]
+
+        na = len(active)
+
+        # Quantize u_s tensors that are not already QuantizedTensorStorage
+        u_s_q_list = []
+        for i in active:
+            u_s = u_s_list[i]
+            if not isinstance(u_s, QuantizedTensorStorage) and quantizer_list[i] is not None:
+                u_s = quantizer_list[i](u_s)
+            u_s_q_list.append(u_s)
+
+        # ---- Step 1: v OP w  ("NN" forward | "NT" backward) ----
+        nvtx_range_push("MetisSvdFunction.grouped_gemm_sep_res.step1")
+        out1 = [
+            torch.empty(
+                MetisSvdFunction._gemm_out_shape(v_list[i], weight_list[i], layout_list[0]),
+                dtype=activation_dtype,
+                device=device,
+            )
+            for i in active
+        ]
+        general_grouped_gemm(
+            [v_list[i] for i in active],
+            [weight_list[i] for i in active],
+            out1,
+            [None] * na,
+            activation_dtype,
+            layout=layout_list[0],
+            grad=is_grad,
+            m_splits=[t.shape[0] for t in out1],
+        )
+        nvtx_range_pop("MetisSvdFunction.grouped_gemm_sep_res.step1")
+
+        # Quantize step-1 outputs before step 2 when running in FP8 mode
+        out1_q = []
+        for k, i in enumerate(active):
+            vw = out1[k]
+            if not isinstance(vw, QuantizedTensorStorage) and quantizer_list[i] is not None:
+                vw = quantizer_list[i](vw)
+            out1_q.append(vw)
+
+        # ---- Step 2: vw OP u_s  ("TN" both forward and backward) ----
+        nvtx_range_push("MetisSvdFunction.grouped_gemm_sep_res.step2")
+        out2 = [
+            torch.empty(
+                MetisSvdFunction._gemm_out_shape(out1_q[k], u_s_q_list[k], layout_list[1]),
+                dtype=activation_dtype,
+                device=device,
+            )
+            for k in range(na)
+        ]
+        general_grouped_gemm(
+            out1_q,
+            u_s_q_list,
+            out2,
+            [None] * na,
+            activation_dtype,
+            layout=layout_list[1],
+            grad=is_grad,
+            m_splits=[t.shape[0] for t in out2],
+        )
+        nvtx_range_pop("MetisSvdFunction.grouped_gemm_sep_res.step2")
+
+        # ---- Step 3: w OP res  ("TN" forward | "NN" backward) ----
+        nvtx_range_push("MetisSvdFunction.grouped_gemm_sep_res.step3")
+        out3 = [
+            torch.empty(
+                MetisSvdFunction._gemm_out_shape(weight_list[i], res_list[i], layout_list[2]),
+                dtype=activation_dtype,
+                device=device,
+            )
+            for i in active
+        ]
+        general_grouped_gemm(
+            [weight_list[i] for i in active],
+            [res_list[i] for i in active],
+            out3,
+            [None] * na,
+            activation_dtype,
+            layout=layout_list[2],
+            grad=is_grad,
+            m_splits=[t.shape[0] for t in out3],
+        )
+        nvtx_range_pop("MetisSvdFunction.grouped_gemm_sep_res.step3")
+
+        # ---- Combine: out_i = restore(uvw_i) + rw_i ----
+        active_out = {}
+        for k, i in enumerate(active):
+            uvw = out2[k]
+            if restore_info_list is not None and restore_info_list[i] is not None:
+                uvw = restore_matrix(uvw, restore_info_list[i], restore_strategy, reinfer_shape=True)
+            active_out[i] = uvw + out3[k]
+
+        # Reconstruct full result list (including empty tensors for zero splits)
+        result = []
+        for i in range(N):
+            if m_splits[i] == 0:
+                out_dim = weight_list[i].size(1) if is_grad else weight_list[i].size(0)
+                result.append(torch.empty(0, out_dim, dtype=activation_dtype, device=device))
+            else:
+                result.append(active_out[i])
+        return result
+
+    @staticmethod
+    @torch.no_grad()
+    def grouped_gemm_with_weight_grad_separate_residual(
+        input_u_s_list,
+        input_v_list,
+        input_res_list,
+        grad_u_s_list,
+        grad_v_list,
+        grad_res_list,
+        activation_dtype,
+        quantizer_list,
+        m_splits,
+        input_restoreinfo_list=None,
+        grad_restoreinfo_list=None,
+        restore_strategy="tile",
+        skip_residual=False,
+    ):
+        """Grouped GEMM for weight gradient with separate residual decomposition.
+
+        Batches the per-split weight-gradient computation across all active splits
+        using general_grouped_gemm, replacing N individual
+        gemm_with_weight_grad_separate_residual calls.
+
+        With A=input_u_s [m,rf], B=input_v [h,rf], C=input_res [m,h],
+             D=grad_u_s  [m,rb], E=grad_v  [out,rb], F=grad_res [m,out]:
+
+        dw_i = (E_i @ (D_i.T @ A_i) @ B_i.T)
+             + (F_i.T @ A_i @ B_i.T)
+             + (E_i @ (D_i.T @ C_i))
+             + (F_i.T @ C_i)            [when skip_residual=False]
+
+        Executed as 8 (or 3 when skip_residual=True) sequential grouped_gemm calls.
+
+        Args:
+            input_u_s_list:        List[Tensor] forward U@S per split.
+            input_v_list:          List[Tensor] forward V per split.
+            input_res_list:        List[Tensor] forward residual per split.
+            grad_u_s_list:         List[Tensor] backward grad U@S per split.
+            grad_v_list:           List[Tensor] backward grad V per split.
+            grad_res_list:         List[Tensor] backward grad residual per split.
+            activation_dtype:      Output dtype.
+            quantizer_list:        List[Optional[Quantizer]] per-split quantizer.
+            m_splits:              List[int] token counts per split.
+            input_restoreinfo_list: Optional list of RestoreInfo for forward u_s restore.
+            grad_restoreinfo_list:  Optional list of RestoreInfo for backward grad_u_s restore.
+            restore_strategy:      Strategy string for restore_matrix.
+            skip_residual:         If True skip terms 2/3/4 (only compute term1).
+
+        Returns:
+            List of weight-gradient tensors, one per split (zeros for zero splits).
+        """
+        N = len(m_splits)
+        device = _get_tensor_device(input_v_list[0])
+
+        # Collect indices of non-empty splits
+        active = [i for i in range(N) if m_splits[i] > 0]
+
+        if not active:
+            return [
+                torch.zeros(input_v_list[i].size(1), input_v_list[i].size(0),
+                            dtype=activation_dtype, device=device)
+                for i in range(N)
+            ]
+
+        na = len(active)
+
+        # Restore and quantize A (input_u_s) and D (grad_u_s) for active splits
+        A_list, D_list = [], []
+        for i in active:
+            A = input_u_s_list[i]
+            if not isinstance(A, QuantizedTensorStorage):
+                if input_restoreinfo_list is not None and input_restoreinfo_list[i] is not None:
+                    A = restore_matrix(A, input_restoreinfo_list[i], restore_strategy, True)
+                if quantizer_list[i] is not None:
+                    A = quantizer_list[i](A)
+            A_list.append(A)
+
+            D = grad_u_s_list[i]
+            if not isinstance(D, QuantizedTensorStorage):
+                if grad_restoreinfo_list is not None and grad_restoreinfo_list[i] is not None:
+                    D = restore_matrix(D, grad_restoreinfo_list[i], restore_strategy, True)
+                if quantizer_list[i] is not None:
+                    D = quantizer_list[i](D)
+            D_list.append(D)
+
+        B_list = [input_v_list[i] for i in active]
+        C_list = [input_res_list[i] for i in active]
+        E_list = [grad_v_list[i] for i in active]
+        F_list = [grad_res_list[i] for i in active]
+
+        # ---- Step 1: DA_T_i = A_i.NT D_i  (layout "NT") ----
+        # shape: (D[1], A[1]) = (rank_bwd, rank_fwd)
+        nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step1")
+        DA_T_list = [
+            torch.empty(
+                MetisSvdFunction._gemm_out_shape(A_list[k], D_list[k], "NT"),
+                dtype=activation_dtype, device=device,
+            )
+            for k in range(na)
+        ]
+        general_grouped_gemm(
+            A_list, D_list, DA_T_list, [None] * na,
+            activation_dtype, layout="NT", grad=True,
+            m_splits=[t.shape[0] for t in DA_T_list],
+        )
+        nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step1")
+
+        # Quantize DA_T for step 2
+        DA_T_q_list = []
+        for k, i in enumerate(active):
+            da_t = DA_T_list[k]
+            if not isinstance(da_t, QuantizedTensorStorage) and quantizer_list[i] is not None:
+                da_t = quantizer_list[i](da_t)
+            DA_T_q_list.append(da_t)
+
+        # ---- Step 2: EDA_i = DA_T_i.NN E_i  (layout "NN") ----
+        # shape: (E[0], DA_T[1]) = (out, rank_fwd)
+        nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step2")
+        EDA_list = [
+            torch.empty(
+                MetisSvdFunction._gemm_out_shape(DA_T_q_list[k], E_list[k], "NN"),
+                dtype=activation_dtype, device=device,
+            )
+            for k in range(na)
+        ]
+        general_grouped_gemm(
+            DA_T_q_list, E_list, EDA_list, [None] * na,
+            activation_dtype, layout="NN", grad=True,
+            m_splits=[t.shape[0] for t in EDA_list],
+        )
+        nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step2")
+
+        # Quantize EDA for step 3
+        EDA_q_list = []
+        for k, i in enumerate(active):
+            eda = EDA_list[k]
+            if not isinstance(eda, QuantizedTensorStorage) and quantizer_list[i] is not None:
+                eda = quantizer_list[i](eda)
+            EDA_q_list.append(eda)
+
+        # ---- Step 3: term1_i = B_i.TN EDA_i  (layout "TN") ----
+        # shape: (EDA[0], B[0]) = (out, h)  -> dw shape
+        nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step3")
+        term1_list = [
+            torch.empty(
+                MetisSvdFunction._gemm_out_shape(B_list[k], EDA_q_list[k], "TN"),
+                dtype=activation_dtype, device=device,
+            )
+            for k in range(na)
+        ]
+        general_grouped_gemm(
+            B_list, EDA_q_list, term1_list, [None] * na,
+            activation_dtype, layout="TN", grad=True,
+            m_splits=[t.shape[0] for t in term1_list],
+        )
+        nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step3")
+
+        if skip_residual:
+            dw_active = {i: term1_list[k] for k, i in enumerate(active)}
+        else:
+            # ---- Step 4: FA_i = A_i.NT F_i  (layout "NT") ----
+            # shape: (F[1], A[1]) = (out, rank_fwd)
+            nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step4")
+            FA_list = [
+                torch.empty(
+                    MetisSvdFunction._gemm_out_shape(A_list[k], F_list[k], "NT"),
+                    dtype=activation_dtype, device=device,
+                )
+                for k in range(na)
+            ]
+            general_grouped_gemm(
+                A_list, F_list, FA_list, [None] * na,
+                activation_dtype, layout="NT", grad=True,
+                m_splits=[t.shape[0] for t in FA_list],
+            )
+            nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step4")
+
+            # Quantize FA for step 5
+            FA_q_list = []
+            for k, i in enumerate(active):
+                fa = FA_list[k]
+                if not isinstance(fa, QuantizedTensorStorage) and quantizer_list[i] is not None:
+                    fa = quantizer_list[i](fa)
+                FA_q_list.append(fa)
+
+            # ---- Step 5: term2_i = B_i.TN FA_i  (layout "TN") ----
+            nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step5")
+            term2_list = [
+                torch.empty(
+                    MetisSvdFunction._gemm_out_shape(B_list[k], FA_q_list[k], "TN"),
+                    dtype=activation_dtype, device=device,
+                )
+                for k in range(na)
+            ]
+            general_grouped_gemm(
+                B_list, FA_q_list, term2_list, [None] * na,
+                activation_dtype, layout="TN", grad=True,
+                m_splits=[t.shape[0] for t in term2_list],
+            )
+            nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step5")
+
+            # ---- Step 6: DC_i = C_i.NT D_i  (layout "NT") ----
+            # shape: (D[1], C[1]) = (rank_bwd, h)
+            nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step6")
+            DC_list = [
+                torch.empty(
+                    MetisSvdFunction._gemm_out_shape(C_list[k], D_list[k], "NT"),
+                    dtype=activation_dtype, device=device,
+                )
+                for k in range(na)
+            ]
+            general_grouped_gemm(
+                C_list, D_list, DC_list, [None] * na,
+                activation_dtype, layout="NT", grad=True,
+                m_splits=[t.shape[0] for t in DC_list],
+            )
+            nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step6")
+
+            # Quantize DC for step 7
+            DC_q_list = []
+            for k, i in enumerate(active):
+                dc = DC_list[k]
+                if not isinstance(dc, QuantizedTensorStorage) and quantizer_list[i] is not None:
+                    dc = quantizer_list[i](dc)
+                DC_q_list.append(dc)
+
+            # ---- Step 7: term3_i = DC_i.NN E_i  (layout "NN") ----
+            # shape: (E[0], DC[1]) = (out, h)
+            nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step7")
+            term3_list = [
+                torch.empty(
+                    MetisSvdFunction._gemm_out_shape(DC_q_list[k], E_list[k], "NN"),
+                    dtype=activation_dtype, device=device,
+                )
+                for k in range(na)
+            ]
+            general_grouped_gemm(
+                DC_q_list, E_list, term3_list, [None] * na,
+                activation_dtype, layout="NN", grad=True,
+                m_splits=[t.shape[0] for t in term3_list],
+            )
+            nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step7")
+
+            # ---- Step 8: term4_i = C_i.NT F_i  (layout "NT") ----
+            # shape: (F[1], C[1]) = (out, h)
+            nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step8")
+            term4_list = [
+                torch.empty(
+                    MetisSvdFunction._gemm_out_shape(C_list[k], F_list[k], "NT"),
+                    dtype=activation_dtype, device=device,
+                )
+                for k in range(na)
+            ]
+            general_grouped_gemm(
+                C_list, F_list, term4_list, [None] * na,
+                activation_dtype, layout="NT", grad=True,
+                m_splits=[t.shape[0] for t in term4_list],
+            )
+            nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step8")
+
+            dw_active = {
+                i: term1_list[k] + term2_list[k] + term3_list[k] + term4_list[k]
+                for k, i in enumerate(active)
+            }
+
+        # Reconstruct full result list
+        result = []
+        for i in range(N):
+            if m_splits[i] == 0:
+                # Zero split: return zeros of weight shape [out, h]
+                out_feat = input_v_list[i].size(1)  # h
+                # grad_v has shape [out, rank], so out = grad_v.size(0)
+                # but we need [out, h]; use E to get out dim
+                out_feat_out = grad_v_list[i].size(0) if grad_v_list[i] is not None else 0
+                result.append(
+                    torch.zeros(out_feat_out, out_feat, dtype=activation_dtype, device=device)
+                )
+            else:
+                result.append(dw_active[i])
+        return result
+
+
 @dataclass
 class MeanQuantResult:
     """封装mean_quant的输出结果"""
@@ -1248,7 +1733,7 @@ class MetisMeanFunction:
         input_shape = quant_result.shape  # (b, s, h) or (b,h)
 
         output_shape = list(input_shape)
-        output_shape[-1] = weight.shape[0]
+        output_shape[-1] = weight.size(0) if hasattr(weight, 'size') else weight.shape[0]
 
         # 从形状信息推断维度
         # batch_size = input_shape[0]
@@ -1306,7 +1791,7 @@ class MetisMeanFunction:
         quant_input = grad_output_result.quant_input
 
         input_shape = list(grad_output_result.shape)
-        hidden_size = weight.shape[1]
+        hidden_size = weight.size(1) if hasattr(weight, 'size') else weight.shape[1]
         input_shape[-1] = hidden_size
         
         # 计算输入梯度：dx = dout @ weight
@@ -1469,3 +1954,315 @@ class MetisMeanFunction:
             dw: 权重梯度，shape为[out_features, h]
         """
         raise NotImplementedError
+
+    @staticmethod
+    @torch.no_grad()
+    def grouped_gemm_operation_with_mean_quant(
+        quant_results,
+        weight_list,
+        activation_dtype,
+        m_splits,
+        quantizer_list=None,
+    ):
+        """Grouped GEMM for mean-quantized inputs across multiple expert splits.
+
+        Batches N individual gemm_operation_with_mean_quant calls into 2
+        sequential general_grouped_gemm calls.
+
+        Computes: out_i = (quant_input_i - quant_mean_i) @ weight_i.T
+                        = (quant_input_i @ weight_i.T) - (quant_mean_i @ weight_i.T)
+
+        Args:
+            quant_results:    List[MeanQuantResult | MeanSplitDimQuantResult] per split.
+            weight_list:      List[Tensor] quantized weight matrices per split.
+            activation_dtype: Output dtype.
+            m_splits:         List[int] token counts per split.
+            quantizer_list:   Optional list of output quantizers (currently unused).
+
+        Returns:
+            List of output tensors, one per split (empty tensor for zero splits).
+        """
+        N = len(m_splits)
+        device = _get_tensor_device(weight_list[0])
+
+        active = [i for i in range(N) if m_splits[i] > 0]
+
+        if not active:
+            return [
+                torch.empty(0, weight_list[i].size(0), dtype=activation_dtype, device=device)
+                for i in range(N)
+            ]
+
+        na = len(active)
+
+        # Build input and mean lists
+        qi_list = [quant_results[i].quant_input for i in active]
+        qm_list = [
+            quant_results[i].get_quant_mean_tensor()
+            if isinstance(quant_results[i], MeanSplitDimQuantResult)
+            else quant_results[i].quant_mean
+            for i in active
+        ]
+        w_list = [weight_list[i] for i in active]
+
+        # Determine output shape: (m_i, out_i)
+        # layout "TN": result = (B.size(0), A.size(0)) = (m_i, out_i)
+        # weight.size(0) = out_features, quant_input.size(0) = m_i
+        out_shape = lambda qi, w: (qi.size(0), w.size(0))
+
+        # ---- out_0: quant_input @ weight.T  (layout "TN") ----
+        nvtx_range_push("MetisMeanFunction.grouped_gemm_mean_quant.out0")
+        out0_list = [
+            torch.empty(out_shape(qi_list[k], w_list[k]), dtype=activation_dtype, device=device)
+            for k in range(na)
+        ]
+        general_grouped_gemm(
+            w_list, qi_list, out0_list, [None] * na,
+            activation_dtype, layout="TN", grad=False,
+            m_splits=[t.shape[0] for t in out0_list],
+        )
+        nvtx_range_pop("MetisMeanFunction.grouped_gemm_mean_quant.out0")
+
+        # ---- out_1: quant_mean @ weight.T  (layout "TN") ----
+        nvtx_range_push("MetisMeanFunction.grouped_gemm_mean_quant.out1")
+        out1_list = [
+            torch.empty(out_shape(qm_list[k], w_list[k]), dtype=activation_dtype, device=device)
+            for k in range(na)
+        ]
+        general_grouped_gemm(
+            w_list, qm_list, out1_list, [None] * na,
+            activation_dtype, layout="TN", grad=False,
+            m_splits=[t.shape[0] for t in out1_list],
+        )
+        nvtx_range_pop("MetisMeanFunction.grouped_gemm_mean_quant.out1")
+
+        # Combine and reshape
+        active_out = {}
+        for k, i in enumerate(active):
+            out_final = out0_list[k] - out1_list[k]
+            output_shape = list(quant_results[i].shape)
+            output_shape[-1] = weight_list[i].size(0)
+            active_out[i] = out_final.view(output_shape)
+
+        result = []
+        for i in range(N):
+            if m_splits[i] == 0:
+                result.append(
+                    torch.empty(0, weight_list[i].size(0), dtype=activation_dtype, device=device)
+                )
+            else:
+                result.append(active_out[i])
+        return result
+
+    @staticmethod
+    @torch.no_grad()
+    def compute_input_gradient_mean_grouped_gemm(
+        grad_output_results,
+        weight_list,
+        activation_dtype,
+        m_splits,
+        quantizer_list=None,
+    ):
+        """Grouped GEMM for input gradient computation with mean quantization.
+
+        Batches N individual compute_input_gradient_mean calls into 2
+        sequential general_grouped_gemm calls.
+
+        Computes: dx_i = (quant_grad_i - quant_grad_mean_i) @ weight_i
+                        = (quant_grad_i @ weight_i) - (quant_grad_mean_i @ weight_i)
+
+        Args:
+            grad_output_results: List[MeanQuantResult | MeanSplitDimQuantResult] per split.
+            weight_list:         List[Tensor] quantized weight matrices per split.
+            activation_dtype:    Output dtype.
+            m_splits:            List[int] token counts per split.
+            quantizer_list:      Optional list of output quantizers (currently unused).
+
+        Returns:
+            List of input-gradient tensors, one per split (empty tensor for zero splits).
+        """
+        N = len(m_splits)
+        device = _get_tensor_device(weight_list[0])
+
+        active = [i for i in range(N) if m_splits[i] > 0]
+
+        if not active:
+            return [
+                torch.empty(0, weight_list[i].size(1), dtype=activation_dtype, device=device)
+                for i in range(N)
+            ]
+
+        na = len(active)
+
+        qi_list = [grad_output_results[i].quant_input for i in active]
+        qm_list = [
+            grad_output_results[i].get_quant_mean_tensor()
+            if isinstance(grad_output_results[i], MeanSplitDimQuantResult)
+            else grad_output_results[i].quant_mean
+            for i in active
+        ]
+        w_list = [weight_list[i] for i in active]
+
+        # layout "NN" grad=True: result = (B.size(0), A.size(1)) = (m_i, h)
+        out_shape = lambda qi, w: (qi.size(0), w.size(1))
+
+        # ---- dx: quant_grad @ weight  (layout "NN", grad=True) ----
+        nvtx_range_push("MetisMeanFunction.grouped_gemm_dgrad_mean.dx")
+        dx_list = [
+            torch.empty(out_shape(qi_list[k], w_list[k]), dtype=activation_dtype, device=device)
+            for k in range(na)
+        ]
+        general_grouped_gemm(
+            w_list, qi_list, dx_list, [None] * na,
+            activation_dtype, layout="NN", grad=True,
+            m_splits=[t.shape[0] for t in dx_list],
+        )
+        nvtx_range_pop("MetisMeanFunction.grouped_gemm_dgrad_mean.dx")
+
+        # ---- dx_mean: quant_grad_mean @ weight  (layout "NN", grad=True) ----
+        nvtx_range_push("MetisMeanFunction.grouped_gemm_dgrad_mean.dx_mean")
+        dx_mean_list = [
+            torch.empty(out_shape(qm_list[k], w_list[k]), dtype=activation_dtype, device=device)
+            for k in range(na)
+        ]
+        general_grouped_gemm(
+            w_list, qm_list, dx_mean_list, [None] * na,
+            activation_dtype, layout="NN", grad=True,
+            m_splits=[t.shape[0] for t in dx_mean_list],
+        )
+        nvtx_range_pop("MetisMeanFunction.grouped_gemm_dgrad_mean.dx_mean")
+
+        # Combine and reshape
+        active_out = {}
+        for k, i in enumerate(active):
+            dx_final = dx_list[k] - dx_mean_list[k]
+            input_shape = list(grad_output_results[i].shape)
+            hidden_size = weight_list[i].size(1)
+            input_shape[-1] = hidden_size
+            active_out[i] = dx_final.view(input_shape)
+
+        result = []
+        for i in range(N):
+            if m_splits[i] == 0:
+                result.append(
+                    torch.empty(0, weight_list[i].size(1), dtype=activation_dtype, device=device)
+                )
+            else:
+                result.append(active_out[i])
+        return result
+
+    @staticmethod
+    @torch.no_grad()
+    def compute_weight_gradient_mean_grouped_gemm(
+        x_quant_list,
+        dy_quant_list,
+        activation_dtype,
+        m_splits,
+        quantizer_list=None,
+    ):
+        """Grouped GEMM for weight gradient computation with mean quantization.
+
+        Batches N individual compute_weight_gradient_mean calls into 4
+        sequential general_grouped_gemm calls.
+
+        With x = x_quant - x_mean, dy = dy_quant - dy_mean:
+          dw_i = dy_i.T @ x_i
+               = (dy_input_i.T @ x_input_i) - (dy_input_i.T @ x_mean_i)
+               - (dy_mean_i.T @ x_input_i)  + (dy_mean_i.T @ x_mean_i)
+
+        All 4 terms use layout "NT" and can be issued as 4 grouped_gemm calls.
+
+        Args:
+            x_quant_list:     List[MeanQuantResult | MeanSplitDimQuantResult] forward quant per split.
+            dy_quant_list:    List[MeanQuantResult | MeanSplitDimQuantResult] grad quant per split.
+            activation_dtype: Output dtype.
+            m_splits:         List[int] token counts per split.
+            quantizer_list:   Optional list of output quantizers (currently unused).
+
+        Returns:
+            List of weight-gradient tensors, one per split (zeros for zero splits).
+        """
+        N = len(m_splits)
+        device = _get_tensor_device(x_quant_list[0].quant_input)
+
+        active = [i for i in range(N) if m_splits[i] > 0]
+
+        if not active:
+            # Return zero-tensors of shape [out, h]
+            result = []
+            for i in range(N):
+                x_q = x_quant_list[i]
+                dy_q = dy_quant_list[i]
+                out_feat = dy_q.quant_input.size(1) if hasattr(dy_q.quant_input, 'size') else dy_q.quant_input.shape[1]
+                in_feat = x_q.quant_input.size(1) if hasattr(x_q.quant_input, 'size') else x_q.quant_input.shape[1]
+                result.append(torch.zeros(out_feat, in_feat, dtype=activation_dtype, device=device))
+            return result
+
+        na = len(active)
+
+        # Extract quant tensors
+        xi_list, xm_list, dyi_list, dym_list = [], [], [], []
+        for i in active:
+            x_q = x_quant_list[i]
+            dy_q = dy_quant_list[i]
+
+            xi_list.append(x_q.quant_input)
+            xi_mean = (
+                x_q.get_quant_mean_tensor()
+                if isinstance(x_q, MeanSplitDimQuantResult)
+                else x_q.quant_mean
+            )
+            xm_list.append(xi_mean)
+
+            dyi_list.append(dy_q.quant_input)
+            dyi_mean = (
+                dy_q.get_quant_mean_tensor()
+                if isinstance(dy_q, MeanSplitDimQuantResult)
+                else dy_q.quant_mean
+            )
+            dym_list.append(dyi_mean)
+
+        # All 4 terms share layout "NT", grad=True
+        # shape: (dy[1], x[1]) = (out_features, h) for each
+        out_shape = lambda x, dy: (dy.size(1), x.size(1))
+
+        def _run_nt_grouped_gemm(A_list, B_list, label):
+            """Run grouped GEMM with layout NT (B.T @ A)."""
+            nvtx_range_push(f"MetisMeanFunction.grouped_gemm_wgrad_mean.{label}")
+            outs = [
+                torch.empty(out_shape(A_list[k], B_list[k]), dtype=activation_dtype, device=device)
+                for k in range(na)
+            ]
+            general_grouped_gemm(
+                A_list, B_list, outs, [None] * na,
+                activation_dtype, layout="NT", grad=True,
+                m_splits=[t.shape[0] for t in outs],
+            )
+            nvtx_range_pop(f"MetisMeanFunction.grouped_gemm_wgrad_mean.{label}")
+            return outs
+
+        # term1: dy_input.T @ x_input
+        term1_list = _run_nt_grouped_gemm(xi_list, dyi_list, "term1")
+        # term2: dy_input.T @ x_mean
+        term2_list = _run_nt_grouped_gemm(xm_list, dyi_list, "term2")
+        # term3: dy_mean.T @ x_input
+        term3_list = _run_nt_grouped_gemm(xi_list, dym_list, "term3")
+        # term4: dy_mean.T @ x_mean
+        term4_list = _run_nt_grouped_gemm(xm_list, dym_list, "term4")
+
+        active_out = {
+            i: term1_list[k] - term2_list[k] - term3_list[k] + term4_list[k]
+            for k, i in enumerate(active)
+        }
+
+        result = []
+        for i in range(N):
+            if m_splits[i] == 0:
+                x_q = x_quant_list[i]
+                dy_q = dy_quant_list[i]
+                out_feat = dy_q.quant_input.size(1)
+                in_feat = x_q.quant_input.size(1)
+                result.append(torch.zeros(out_feat, in_feat, dtype=activation_dtype, device=device))
+            else:
+                result.append(active_out[i])
+        return result
