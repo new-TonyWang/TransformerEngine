@@ -378,7 +378,7 @@ class _MetisGroupedLinear(torch.autograd.Function):
                                 niter=ctx.metis_context.backward_lowrank_niter,
                                 token_drop_rate=ctx.metis_context.backward_token_drop_rate,
                                 broadcast_dim=ctx.metis_context.backward_broadcast_dim,
-                                enable_gradient_accumulation_optimization=ctx.metis_context.enable_gradient_accumulation_optimization,
+                                enable_history_optimization=ctx.metis_context.enable_gradient_accumulation_optimization,
                                 use_power_iteration_svd=ctx.metis_context.use_grad_power_iteration_svd,
                                 power_iteration_time=ctx.metis_context.grad_power_iteration_time,
                                 load_history=ctx.metis_context.load_history,
@@ -386,7 +386,7 @@ class _MetisGroupedLinear(torch.autograd.Function):
                                 tp_size=1,
                                 tp_group=None,
                                 tp_strategy=ctx.metis_context.tp_strategy,
-                                parallel_mode=None,
+                                parallel_mode="",
                             )
                         )
                         output_grad_ug_sg_list[i] = ug_sg

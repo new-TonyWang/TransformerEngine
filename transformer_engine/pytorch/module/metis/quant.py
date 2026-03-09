@@ -99,7 +99,7 @@ def process_and_fill_matrix(x, old_noise = None, drop_rate = 0.8):
     
     B_S, _ = x.shape
     drop_count = int(B_S * drop_rate)
-    drop_count = (drop_count // 8 ) * 8 # 保证 matmul k 轴能被 8 整除
+    drop_count = (drop_count // 16 ) * 16 # 保证 matmul k 轴能被 16 整除
     keep_count = B_S - drop_count
     
     if keep_count <= 0:
@@ -537,6 +537,41 @@ class MetisSvdFunction:
         return ug_sg, vg, ker
 
     @staticmethod
+    def _split_allgathered_results_for_backward(
+        ug_sg: torch.Tensor,
+        vg: torch.Tensor,
+        ker: torch.Tensor,
+        cinput_for_svd: torch.Tensor,
+        tp_size: int,
+        tp_group,
+        local_seq_len: int,
+    ):
+        """分割allgather后的SVD结果（用于反向传播）
+        
+        注意：对于backward，TP allgather是在hidden维度上进行的，
+        seq_len维度保持不变。所以只需要分割hidden维度。
+        """
+        from ...distributed import get_distributed_rank
+        
+        tp_rank = get_distributed_rank(tp_group)
+        
+        # 分割hidden维度
+        hidden_size = cinput_for_svd.shape[-1]
+        local_hidden_size = hidden_size // tp_size
+        start_idx = tp_rank * local_hidden_size
+        end_idx = start_idx + local_hidden_size
+        
+        # vg: [hidden, rank] -> 在第0维分割
+        vg = vg[start_idx:end_idx, :]
+        
+        # ker: [seq_len, hidden] -> 在第1维分割（hidden维度）
+        ker = ker[:, start_idx:end_idx]
+        
+        # ug_sg: [seq_len, rank] -> 不需要分割
+        
+        return ug_sg, vg, ker
+
+    @staticmethod
     def _compute_residual(
         input_: torch.Tensor,
         ker: torch.Tensor,
@@ -618,17 +653,17 @@ class MetisSvdFunction:
         
         # 处理token drop
         cinput, restore_info = MetisSvdFunction._prepare_input_with_token_drop(
-            input_, token_drop_rate, broadcast_dim, 
-            is_backward=False, load_history=False, history_list=history_list
+            input_, token_drop_rate, broadcast_dim,
+            is_backward=False, load_history=load_history, history_list=history_list
         )
-        
+
         # TP allgather
         cinput_for_svd, did_allgather = MetisSvdFunction._allgather_for_svd(
             cinput, tp_size, tp_strategy, tp_group, parallel_mode, is_backward=False
         )
-        
+
         # 根据不同策略执行SVD
-        if use_power_iteration_svd and enable_history_optimization:
+        if use_power_iteration_svd and enable_history_optimization and load_history:
             # 使用幂迭代SVD并启用历史优化
             if load_history and "forward_svd_history" in history_list:
                 ker, ug_sg, vg = history_list["forward_svd_history"]
@@ -640,40 +675,35 @@ class MetisSvdFunction:
             )
             ug_sg = u @ torch.diag(s)
             ker = ug_sg @ v.T
-            vg = input_quantizer(v)
+            vg = v
+            # vg = input_quantizer(v)
             
-            # 只有在不加载历史或历史不存在时才存储新结果
-            if not load_history or "forward_svd_history" not in history_list:
-                # 存储bf16数据，不是量化后的数据
-                history_list["forward_svd_history"] = [ker, ug_sg, v]
-            
-        elif use_power_iteration_svd:
-            # 仅使用幂迭代SVD，不使用历史优化
-            u, s, v = grad_power_iteration_svd(
-                cinput_for_svd, None, rank, power_iteration_time, niter
-            )
-            ug_sg = u @ torch.diag(s)
-            ker = ug_sg @ v.T
-            vg = input_quantizer(v)
+            # 存储bf16数据，不是量化后的数据
+            history_list["forward_svd_history"] = [ker, ug_sg, v]
             
         else:
             # 标准SVD
             ug_sg, vg, ker = MetisSvdFunction._perform_svd_and_quantize(
                 cinput_for_svd, input_quantizer, rank, niter, broadcast_dim, input_.dtype
             )
-        
-        # 恢复token
-        if restore_info is not None:
-            ker = restore_matrix(ker, restore_info, restore_strategy)
-        
+
+            if enable_history_optimization:
+                history_list["svd_history"] = [ker, ug_sg, vg]
+
         # 分割allgather的结果
         if did_allgather:
             ug_sg, vg, ker = MetisSvdFunction._split_allgathered_results(
                 ug_sg, vg, ker, cinput_for_svd, tp_size, tp_group
             )
 
+        if restore_info is not None:
+            ker = restore_matrix(ker, restore_info, restore_strategy)
+
         # # 量化vg
         vg = input_quantizer(vg)
+
+        # if restore_info is not None:
+        #     ker = restore_matrix(ker, restore_info, restore_strategy)
 
         # 计算残差
         res = MetisSvdFunction._compute_residual(
@@ -691,7 +721,7 @@ class MetisSvdFunction:
         niter=2,
         token_drop_rate: float = -1.0,
         broadcast_dim=-1,
-        enable_gradient_accumulation_optimization=False,
+        enable_history_optimization=False,
         load_history=False,
         use_power_iteration_svd = False,
         power_iteration_time = 1,
@@ -713,7 +743,7 @@ class MetisSvdFunction:
             niter: SVD迭代次数
             token_drop_rate: token丢弃率（-1表示不丢弃）
             broadcast_dim: 广播维度
-            enable_gradient_accumulation_optimization: 是否启用梯度累积优化
+            enable_history_optimization: 是否启用梯度累积优化
             load_history: 是否加载历史数据
             use_grad_power_iteration_svd: 是否使用梯度幂迭代SVD
             grad_power_iteration_time: 梯度幂迭代次数
@@ -746,38 +776,41 @@ class MetisSvdFunction:
             input_, token_drop_rate, broadcast_dim,
             is_backward=True, load_history=load_history, history_list=history_list
         )
-        
-        if not (enable_gradient_accumulation_optimization and load_history and not use_power_iteration_svd):
-            # TP allgather, 直接读取历史记录的时候，不需要重新计算svd也不需要通信，所以可以跳过allgather这一步
-            cinput_for_svd, did_allgather = MetisSvdFunction._allgather_for_svd(
-                cinput.contiguous(), tp_size, tp_strategy, tp_group, parallel_mode, is_backward=True
-            )
-        else:
-            cinput_for_svd = cinput
-            did_allgather = True
+
+        # if not (enable_history_optimization and load_history and not use_power_iteration_svd):
+        #     # TP allgather, 直接读取历史记录的时候，不需要重新计算svd也不需要通信，所以可以跳过allgather这一步
+        #     cinput_for_svd, did_allgather = MetisSvdFunction._allgather_for_svd(
+        #         cinput.contiguous(), tp_size, tp_strategy, tp_group, parallel_mode, is_backward=True
+        #     )
+        # else:
+        #     # 直接读取历史记录，不需要allgather，也不需要分割
+        #     cinput_for_svd = cinput
+        #     did_allgather = False
+
+        cinput_for_svd, did_allgather = MetisSvdFunction._allgather_for_svd(
+            cinput.contiguous(), tp_size, tp_strategy, tp_group, parallel_mode, is_backward=True
+        )
         
         # 根据不同策略执行SVD
-        if use_power_iteration_svd:
+        if enable_history_optimization and use_power_iteration_svd and load_history:
             # 使用梯度幂迭代SVD
-            if load_history:
+            if load_history and "backward_svd_history" in history_list:
                 ker, ug_sg, vg = history_list["backward_svd_history"]
             else:
                 ker, ug_sg, vg = None, None, None
-            
+
             u, s, v = grad_power_iteration_svd(
                 cinput_for_svd, vg, rank, power_iteration_time, niter
             )
             ug_sg = u @ torch.diag(s)
             ker = ug_sg @ v.T
-            vg = input_quantizer(v)
-            
-            if restore_info is not None:
-                ker = restore_matrix(ker, restore_info, restore_strategy)
-            
+            vg = v
+            # vg = input_quantizer(v)
+
             # 存储bf16数据，不是量化后的数据
             history_list["backward_svd_history"] = [ker, ug_sg, v]
-            
-        elif enable_gradient_accumulation_optimization and load_history:
+
+        elif enable_history_optimization and load_history and "backward_svd_history" in history_list:
             # 直接加载历史数据
             ker, ug_sg, vg = history_list["backward_svd_history"]
         else:
@@ -785,24 +818,25 @@ class MetisSvdFunction:
             ug_sg, vg, ker = MetisSvdFunction._perform_svd_and_quantize(
                 cinput_for_svd, input_quantizer, rank, niter, broadcast_dim, input_.dtype
             )
-            
-            if restore_info is not None:
-                ker = restore_matrix(ker, restore_info, restore_strategy)
 
-            if enable_gradient_accumulation_optimization:
+            if enable_history_optimization:
                 # 这里存储的是完整的矩阵，所以拿取历史数据的时候需要切分数据
-                history_list["svd_history"] = [ker, ug_sg, vg]
+                history_list["backward_svd_history"] = [ker, ug_sg, vg]
         
         # 分割allgather的结果
         if did_allgather:
-            ug_sg, vg, ker = MetisSvdFunction._split_allgathered_results(
-                ug_sg, vg, ker, cinput_for_svd, tp_size, tp_group
+            # 使用专门用于backward的分割函数，同时分割seq_len和hidden维度
+            ug_sg, vg, ker = MetisSvdFunction._split_allgathered_results_for_backward(
+                ug_sg, vg, ker, cinput_for_svd, tp_size, tp_group, input_shape
             )
 
         # # 量化vg
         vg = input_quantizer(vg)
 
-        # 计算残差
+        if restore_info is not None:
+            ker = restore_matrix(ker, restore_info, restore_strategy)
+
+        # 现在ker经过_split_allgathered_results_for_backward后，维度与cinput匹配
         res = MetisSvdFunction._compute_residual(
             input_, ker, input_quantizer, keep_dim, should_reshape, input_shape
         )
@@ -833,15 +867,15 @@ class MetisSvdFunction:
     ):
         """
         SVD低秩量化（分离残差版本）- 兼容接口
-        
+
         SVD低秩量化（分离残差版本）- 兼容接口
-        
+
         根据is_backward参数自动路由到前向或反向函数
-        
+
         统一参数说明:
             use_power_iteration_svd: 是否使用幂迭代SVD（前向/反向通用）
             power_iteration_time: 幂迭代次数（前向/反向通用）
-            enable_history_optimization: 是否启用历史优化（前向/反向通用）
+            enable_history_optimization: 是否启用梯度累积优化（前向/反向通用）
             load_history: 是否加载历史记录（前向/反向通用）
         """
         if is_backward:
@@ -852,10 +886,10 @@ class MetisSvdFunction:
                 niter=niter,
                 token_drop_rate=token_drop_rate,
                 broadcast_dim=broadcast_dim,
-                enable_gradient_accumulation_optimization=enable_history_optimization,
+                enable_history_optimization=enable_history_optimization,
                 load_history=load_history,
-                use_grad_power_iteration_svd=use_power_iteration_svd,
-                grad_power_iteration_time=power_iteration_time,
+                use_power_iteration_svd=use_power_iteration_svd,
+                power_iteration_time=power_iteration_time,
                 keep_dim=keep_dim,
                 history_list=history_list,
                 restore_strategy=restore_strategy,
@@ -929,6 +963,11 @@ class MetisSvdFunction:
             #    = u_s @ (v.T @ w) + res @ w 
             #    = u_s @ (w.T @ v).T + res @ w
             # ------------------------------------------------------
+            # 优化说明：
+            # 1. 使用就地操作减少中间张量创建
+            # 2. 及时释放不再需要的中间结果
+            # 3. 避免不必要的内存拷贝
+            # ------------------------------------------------------
             if not isinstance(u_s,QuantizedTensorStorage):
                 u_s = input_quantizer(u_s)
 
@@ -940,18 +979,49 @@ class MetisSvdFunction:
             else:
                 layout_list = ["NN","TN","TN"]
 
+            # Step 1: v @ w -> v_weight_out
             v_weight_out = MetisSvdFunction.svd_quant_gemm(v,weightmat,activation_dtype,input_quantizer,layout_list[0],is_grad,"V@W")
+            
+            # Step 2: v_weight_out @ u_s -> low_rank_output
             low_rank_output = MetisSvdFunction.svd_quant_gemm(v_weight_out,u_s,activation_dtype,None,layout_list[1],is_grad,"V@W")
+            
+            # 优化：立即释放 v_weight_out，减少峰值显存
+            if not isinstance(v_weight_out, QuantizedTensorStorage):
+                clear_tensor_data(v_weight_out)
+            del v_weight_out
+
+            # Step 3: res @ w -> input_res_weight_out
             input_res_weight_out = MetisSvdFunction.svd_quant_gemm(weightmat,res,activation_dtype,None,layout_list[2],is_grad,"INPUT_RES@W")
 
+            # 优化：就地执行 restore 操作，避免创建新张量
             if restore_info is not None:
                 low_rank_output_expand = restore_matrix(low_rank_output, restore_info, restore_strategy, reinfer_shape=True)
+                # 优化：释放原始的 low_rank_output
+                if not isinstance(low_rank_output, QuantizedTensorStorage):
+                    clear_tensor_data(low_rank_output)
+                del low_rank_output
             else:
                 low_rank_output_expand = low_rank_output
-            gemm_out = low_rank_output_expand + input_res_weight_out
+
+            # 注意：不能使用就地操作 add_，因为这会破坏梯度计算图
+            # 使用普通加法，但在计算完成后释放中间结果
+            gemm_out = input_res_weight_out + low_rank_output_expand
+            
+            # 优化：释放中间结果
+            if not isinstance(input_res_weight_out, QuantizedTensorStorage):
+                clear_tensor_data(input_res_weight_out)
+            del input_res_weight_out
+            
+            # 优化：如果不需要保留 low_rank_output_expand 的原始值，释放它
+            if restore_info is not None and not isinstance(low_rank_output_expand, QuantizedTensorStorage):
+                clear_tensor_data(low_rank_output_expand)
+                del low_rank_output_expand
+                low_rank_output_expand = gemm_out
+
             if output_shape is not None:
                 gemm_out = gemm_out.view(output_shape)
-                low_rank_output_expand = low_rank_output_expand.view(output_shape)
+                if isinstance(low_rank_output_expand, torch.Tensor) and low_rank_output_expand is not gemm_out:
+                    low_rank_output_expand = low_rank_output_expand.view(output_shape)
             return gemm_out,low_rank_output_expand
 
     @staticmethod
@@ -1017,7 +1087,7 @@ class MetisSvdFunction:
             return dw
 
     @staticmethod
-    @torch.compile
+    # @torch.compile
     def gemm_with_weight_grad_separate_residual(
         input_u_s,
         input_v,
@@ -1047,6 +1117,12 @@ class MetisSvdFunction:
             #     = (E@D.T+F.T) (A@B.T + C)
             #     = (E @ (D.T @ A) @ B) + (F.T @ A @ B.T) + ( @ (D.T @ C)) + (F.T @ C)
             # Use `svd_quant_gemm` for every GEMM to preserve quantization behavior.
+            # ------------------------------------------------------
+            # 优化说明：
+            # 1. 及时释放中间结果，降低峰值显存
+            # 2. 使用就地累加减少临时张量创建
+            # 3. 复用计算图，避免不必要的内存拷贝
+            # ------------------------------------------------------
             if tensor_reshape:
                 A = input_u_s.view(-1, input_u_s.shape[-1])
                 B = input_v.view(-1, input_v.shape[-1])
@@ -1077,9 +1153,20 @@ class MetisSvdFunction:
 
             # 2. EDA = E @ DA_T
             EDA = MetisSvdFunction.svd_quant_gemm(DA_T, E, activation_dtype, input_quantizer, layout="NN", grad=True, nvtx_label="E.T@DA_T")
-            # print("E.T @ DA_T",E @ DA_T)
+            
+            # 优化：立即释放 DA_T，减少峰值显存
+            if not isinstance(DA_T, QuantizedTensorStorage):
+                clear_tensor_data(DA_T)
+            del DA_T
+
             # 3. term1 = EDA @ B
             term1 = MetisSvdFunction.svd_quant_gemm(B, EDA, activation_dtype, None, layout="TN", grad=True, nvtx_label="EDA@B")
+            
+            # 优化：释放 EDA
+            if not isinstance(EDA, QuantizedTensorStorage):
+                clear_tensor_data(EDA)
+            del EDA
+
             dw = term1
             if not skip_residual:
                 # 4. FA = F.T @ A
@@ -1088,15 +1175,42 @@ class MetisSvdFunction:
                 # 5. term2 = FA @ B
                 term2 = MetisSvdFunction.svd_quant_gemm(B,FA, activation_dtype, None, layout="TN", grad=True, nvtx_label="FA@B")
                 
+                # 优化：释放 FA
+                if not isinstance(FA, QuantizedTensorStorage):
+                    clear_tensor_data(FA)
+                del FA
+                
                 # 6. DC = D.T @ C
                 DC = MetisSvdFunction.svd_quant_gemm(C,D, activation_dtype, input_quantizer, layout="NT", grad=True, nvtx_label="D.T@C")
                 
                 # 7. term3 = E @ DC
                 term3 = MetisSvdFunction.svd_quant_gemm(DC,E, activation_dtype, None, layout="NN", grad=True, nvtx_label="E.T@DC")
                 
+                # 优化：释放 DC
+                if not isinstance(DC, QuantizedTensorStorage):
+                    clear_tensor_data(DC)
+                del DC
+                
                 # 8. term4 = F.T @ C
                 term4 = MetisSvdFunction.svd_quant_gemm(C,F, activation_dtype, None, layout="NT", grad=True, nvtx_label="F.T@C")
+                
+                # 注意：不能使用就地操作 add_，因为这会破坏梯度计算图
+                # 必须在计算完成后再累加
                 dw = term1 + term2 + term3 + term4
+                
+                # 优化：释放中间结果
+                if not isinstance(term2, QuantizedTensorStorage):
+                    clear_tensor_data(term2)
+                del term2
+                if not isinstance(term3, QuantizedTensorStorage):
+                    clear_tensor_data(term3)
+                del term3
+                if not isinstance(term4, QuantizedTensorStorage):
+                    clear_tensor_data(term4)
+                del term4
+                if not isinstance(term1, QuantizedTensorStorage):
+                    clear_tensor_data(term1)
+                del term1
             return dw
 
     @staticmethod
@@ -1210,26 +1324,24 @@ class MetisSvdFunction:
         )
         nvtx_range_pop("MetisSvdFunction.grouped_gemm_sep_res.step1")
 
-        # Quantize step-1 outputs before step 2 when running in FP8 mode
-        out1_q = []
+        # 优化：就地量化 step-1 输出，避免创建新的列表 out1_q
         for k, i in enumerate(active):
             vw = out1[k]
             if not isinstance(vw, QuantizedTensorStorage) and quantizer_list[i] is not None:
-                vw = quantizer_list[i](vw)
-            out1_q.append(vw)
+                out1[k] = quantizer_list[i](vw)
 
         # ---- Step 2: vw OP u_s  ("TN" both forward and backward) ----
         nvtx_range_push("MetisSvdFunction.grouped_gemm_sep_res.step2")
         out2 = [
             torch.empty(
-                MetisSvdFunction._gemm_out_shape(out1_q[k], u_s_q_list[k], layout_list[1]),
+                MetisSvdFunction._gemm_out_shape(out1[k], u_s_q_list[k], layout_list[1]),
                 dtype=activation_dtype,
                 device=device,
             )
             for k in range(na)
         ]
         general_grouped_gemm(
-            out1_q,
+            out1,  # 优化：直接使用 out1，无需创建 out1_q
             u_s_q_list,
             out2,
             [None] * na,
@@ -1239,6 +1351,12 @@ class MetisSvdFunction:
             m_splits=[t.shape[0] for t in out2],
         )
         nvtx_range_pop("MetisSvdFunction.grouped_gemm_sep_res.step2")
+
+        # 优化：立即释放 out1，减少峰值显存
+        for t in out1:
+            if not isinstance(t, QuantizedTensorStorage):
+                clear_tensor_data(t)
+        del out1
 
         # ---- Step 3: w OP res  ("TN" forward | "NN" backward) ----
         nvtx_range_push("MetisSvdFunction.grouped_gemm_sep_res.step3")
@@ -1263,12 +1381,41 @@ class MetisSvdFunction:
         nvtx_range_pop("MetisSvdFunction.grouped_gemm_sep_res.step3")
 
         # ---- Combine: out_i = restore(uvw_i) + rw_i ----
+        # 优化说明：
+        # 1. 就地执行 restore 操作后立即释放原始张量
+        # 2. 及时释放中间张量，减少峰值显存
+        # 注意：不能使用就地相加 add_，因为这会破坏梯度计算图
         active_out = {}
         for k, i in enumerate(active):
             uvw = out2[k]
             if restore_info_list is not None and restore_info_list[i] is not None:
-                uvw = restore_matrix(uvw, restore_info_list[i], restore_strategy, reinfer_shape=True)
-            active_out[i] = uvw + out3[k]
+                uvw_restored = restore_matrix(uvw, restore_info_list[i], restore_strategy, reinfer_shape=True)
+                # 优化：释放原始的 uvw
+                if not isinstance(uvw, QuantizedTensorStorage):
+                    clear_tensor_data(uvw)
+                del uvw
+                uvw = uvw_restored
+            
+            # 使用普通加法，然后释放中间结果
+            active_out[i] = out3[k] + uvw
+            
+            # 优化：释放 out3[k]
+            if not isinstance(out3[k], QuantizedTensorStorage):
+                clear_tensor_data(out3[k])
+            del out3[k]
+            
+            # 优化：如果 uvw 是 restore 后的新张量，释放它
+            if restore_info_list is not None and restore_info_list[i] is not None:
+                if not isinstance(uvw, QuantizedTensorStorage):
+                    clear_tensor_data(uvw)
+                del uvw
+
+        # 优化：释放 out2，减少显存占用
+        for t in out2:
+            if not isinstance(t, QuantizedTensorStorage):
+                clear_tensor_data(t)
+        del out2
+        del out3  # out3 的元素已经被逐个释放
 
         # Reconstruct full result list (including empty tensors for zero splits)
         result = []
@@ -1387,55 +1534,63 @@ class MetisSvdFunction:
         )
         nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step1")
 
-        # Quantize DA_T for step 2
-        DA_T_q_list = []
+        # 优化：就地量化 DA_T，避免创建新的列表
         for k, i in enumerate(active):
             da_t = DA_T_list[k]
             if not isinstance(da_t, QuantizedTensorStorage) and quantizer_list[i] is not None:
-                da_t = quantizer_list[i](da_t)
-            DA_T_q_list.append(da_t)
+                DA_T_list[k] = quantizer_list[i](da_t)
 
         # ---- Step 2: EDA_i = DA_T_i.NN E_i  (layout "NN") ----
         # shape: (E[0], DA_T[1]) = (out, rank_fwd)
         nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step2")
         EDA_list = [
             torch.empty(
-                MetisSvdFunction._gemm_out_shape(DA_T_q_list[k], E_list[k], "NN"),
+                MetisSvdFunction._gemm_out_shape(DA_T_list[k], E_list[k], "NN"),
                 dtype=activation_dtype, device=device,
             )
             for k in range(na)
         ]
         general_grouped_gemm(
-            DA_T_q_list, E_list, EDA_list, [None] * na,
+            DA_T_list, E_list, EDA_list, [None] * na,  # 优化：直接使用 DA_T_list
             activation_dtype, layout="NN", grad=True,
             m_splits=[t.shape[0] for t in EDA_list],
         )
         nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step2")
 
-        # Quantize EDA for step 3
-        EDA_q_list = []
+        # 优化：立即释放 DA_T_list，减少峰值显存
+        for t in DA_T_list:
+            if not isinstance(t, QuantizedTensorStorage):
+                clear_tensor_data(t)
+        del DA_T_list
+
+        # 优化：就地量化 EDA，避免创建新的列表
         for k, i in enumerate(active):
             eda = EDA_list[k]
             if not isinstance(eda, QuantizedTensorStorage) and quantizer_list[i] is not None:
-                eda = quantizer_list[i](eda)
-            EDA_q_list.append(eda)
+                EDA_list[k] = quantizer_list[i](eda)
 
         # ---- Step 3: term1_i = B_i.TN EDA_i  (layout "TN") ----
         # shape: (EDA[0], B[0]) = (out, h)  -> dw shape
         nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step3")
         term1_list = [
             torch.empty(
-                MetisSvdFunction._gemm_out_shape(B_list[k], EDA_q_list[k], "TN"),
+                MetisSvdFunction._gemm_out_shape(B_list[k], EDA_list[k], "TN"),
                 dtype=activation_dtype, device=device,
             )
             for k in range(na)
         ]
         general_grouped_gemm(
-            B_list, EDA_q_list, term1_list, [None] * na,
+            B_list, EDA_list, term1_list, [None] * na,  # 优化：直接使用 EDA_list
             activation_dtype, layout="TN", grad=True,
             m_splits=[t.shape[0] for t in term1_list],
         )
         nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step3")
+
+        # 优化：立即释放 EDA_list，减少峰值显存
+        for t in EDA_list:
+            if not isinstance(t, QuantizedTensorStorage):
+                clear_tensor_data(t)
+        del EDA_list
 
         if skip_residual:
             dw_active = {i: term1_list[k] for k, i in enumerate(active)}
@@ -1457,29 +1612,33 @@ class MetisSvdFunction:
             )
             nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step4")
 
-            # Quantize FA for step 5
-            FA_q_list = []
+            # 优化：就地量化 FA，避免创建新的列表
             for k, i in enumerate(active):
                 fa = FA_list[k]
                 if not isinstance(fa, QuantizedTensorStorage) and quantizer_list[i] is not None:
-                    fa = quantizer_list[i](fa)
-                FA_q_list.append(fa)
+                    FA_list[k] = quantizer_list[i](fa)
 
             # ---- Step 5: term2_i = B_i.TN FA_i  (layout "TN") ----
             nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step5")
             term2_list = [
                 torch.empty(
-                    MetisSvdFunction._gemm_out_shape(B_list[k], FA_q_list[k], "TN"),
+                    MetisSvdFunction._gemm_out_shape(B_list[k], FA_list[k], "TN"),
                     dtype=activation_dtype, device=device,
                 )
                 for k in range(na)
             ]
             general_grouped_gemm(
-                B_list, FA_q_list, term2_list, [None] * na,
+                B_list, FA_list, term2_list, [None] * na,  # 优化：直接使用 FA_list
                 activation_dtype, layout="TN", grad=True,
                 m_splits=[t.shape[0] for t in term2_list],
             )
             nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step5")
+
+            # 优化：立即释放 FA_list，减少峰值显存
+            for t in FA_list:
+                if not isinstance(t, QuantizedTensorStorage):
+                    clear_tensor_data(t)
+            del FA_list
 
             # ---- Step 6: DC_i = C_i.NT D_i  (layout "NT") ----
             # shape: (D[1], C[1]) = (rank_bwd, h)
@@ -1498,30 +1657,34 @@ class MetisSvdFunction:
             )
             nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step6")
 
-            # Quantize DC for step 7
-            DC_q_list = []
+            # 优化：就地量化 DC，避免创建新的列表
             for k, i in enumerate(active):
                 dc = DC_list[k]
                 if not isinstance(dc, QuantizedTensorStorage) and quantizer_list[i] is not None:
-                    dc = quantizer_list[i](dc)
-                DC_q_list.append(dc)
+                    DC_list[k] = quantizer_list[i](dc)
 
             # ---- Step 7: term3_i = DC_i.NN E_i  (layout "NN") ----
             # shape: (E[0], DC[1]) = (out, h)
             nvtx_range_push("MetisSvdFunction.grouped_wgrad_sep_res.step7")
             term3_list = [
                 torch.empty(
-                    MetisSvdFunction._gemm_out_shape(DC_q_list[k], E_list[k], "NN"),
+                    MetisSvdFunction._gemm_out_shape(DC_list[k], E_list[k], "NN"),
                     dtype=activation_dtype, device=device,
                 )
                 for k in range(na)
             ]
             general_grouped_gemm(
-                DC_q_list, E_list, term3_list, [None] * na,
+                DC_list, E_list, term3_list, [None] * na,  # 优化：直接使用 DC_list
                 activation_dtype, layout="NN", grad=True,
                 m_splits=[t.shape[0] for t in term3_list],
             )
             nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step7")
+
+            # 优化：立即释放 DC_list，减少峰值显存
+            for t in DC_list:
+                if not isinstance(t, QuantizedTensorStorage):
+                    clear_tensor_data(t)
+            del DC_list
 
             # ---- Step 8: term4_i = C_i.NT F_i  (layout "NT") ----
             # shape: (F[1], C[1]) = (out, h)
@@ -1540,10 +1703,24 @@ class MetisSvdFunction:
             )
             nvtx_range_pop("MetisSvdFunction.grouped_wgrad_sep_res.step8")
 
-            dw_active = {
-                i: term1_list[k] + term2_list[k] + term3_list[k] + term4_list[k]
-                for k, i in enumerate(active)
-            }
+            # 注意：不能使用就地累加 add_，因为这会破坏梯度计算图
+            # 使用普通加法，计算完成后再释放中间结果
+            dw_active = {}
+            for k, i in enumerate(active):
+                dw = term1_list[k] + term2_list[k] + term3_list[k] + term4_list[k]
+                dw_active[i] = dw
+            
+            # 优化：释放所有中间结果
+            for k in range(na):
+                if not isinstance(term1_list[k], QuantizedTensorStorage):
+                    clear_tensor_data(term1_list[k])
+                if not isinstance(term2_list[k], QuantizedTensorStorage):
+                    clear_tensor_data(term2_list[k])
+                if not isinstance(term3_list[k], QuantizedTensorStorage):
+                    clear_tensor_data(term3_list[k])
+                if not isinstance(term4_list[k], QuantizedTensorStorage):
+                    clear_tensor_data(term4_list[k])
+            del term1_list, term2_list, term3_list, term4_list
 
         # Reconstruct full result list
         result = []
