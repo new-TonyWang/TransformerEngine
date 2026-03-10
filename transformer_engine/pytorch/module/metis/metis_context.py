@@ -9,6 +9,7 @@ class QuantizationStrategy(Enum):
     BASE = "base"
     SEPARATE_RESIDUAL = "separate_residual"
     MEAN = "mean"
+    MEAN_DIM0_ONLY = "mean_dim0_only"
     
     @classmethod
     def from_string(cls, value):
@@ -176,6 +177,8 @@ def get_metis_context(**kwargs):
             ...
     """
     old_state = {}
+    import debugpy
+    debugpy.breakpoint()
     # print("entering metis context with ", kwargs)
     try:
         # 保存旧值并设置新值

@@ -1804,6 +1804,66 @@ class MeanSplitDimQuantResult:
         clear_tensor_data(self.quant_input,self.input_tensor_mean_dim0,self.input_tensor_mean_dim1,self.cached_quant_mean_tensor)
         self.shape = None
 
+
+@dataclass
+class MeanDim0QuantResult:
+    """封装 mean_dim0_only_quant 的输出结果。
+
+    只对 dim=0 计算均值，不计算 dim=1 均值。
+    量化均值时对第 0 维 padding 到 64 的倍数，GEMM 后仅取第一行结果。
+    """
+    quant_input: QuantizedTensorStorage  # 量化后的输入张量，shape [b*s, h]
+    input_tensor_mean_dim0: torch.Tensor = None  # dim=0 均值，shape [1, h]
+    shape: tuple = tuple()  # 原始输入形状，例如 (b, s, h)
+    cached_quant_mean_tensor: QuantizedTensorStorage = None  # 仅用于保存/加载，用后需手动设为 None
+
+    def _pad_rows_to_multiple_of_64(self, t: torch.Tensor) -> torch.Tensor:
+        """将张量第 0 维 padding 到 64 的倍数。"""
+        rows = t.shape[0]
+        pad_rows = ((rows + 63) // 64) * 64
+        if pad_rows > rows:
+            return F.pad(t, (0, 0, 0, pad_rows - rows), mode='constant', value=0)
+        return t
+
+    def prepare_for_saving(self):
+        quant_input_tensors, _ = self.quant_input.prepare_for_saving()
+        tensors = quant_input_tensors
+        tensors.extend([self.input_tensor_mean_dim0])
+        self.input_tensor_mean_dim0 = None
+        self.cached_quant_mean_tensor = None
+        return tensors, self
+
+    def restore_from_saved(
+        self, tensors: list[Optional[torch.Tensor]]
+    ) -> list[Optional[torch.Tensor]]:
+        """Restore the tensor base data from the saved tensors list."""
+        tensors = self.quant_input.restore_from_saved(tensors)
+        self.input_tensor_mean_dim0 = tensors[0]
+        return tensors[1:]
+
+    def get_quant_mean_tensor(self) -> QuantizedTensorStorage:
+        """返回量化后的均值张量（dim=0 padding 到 64 的倍数）。
+
+        Returns:
+            形状为 [pad64, h] 的量化张量，pad64 是 1 padding 到 64 后的行数（通常为 64）。
+            GEMM 完成后仅取第 0 行作为有效结果。
+        """
+        if self.cached_quant_mean_tensor is not None:
+            return self.cached_quant_mean_tensor
+        mean_padded = self._pad_rows_to_multiple_of_64(self.input_tensor_mean_dim0)  # [64, h]
+        return self.quant_input._quantizer(mean_padded)
+
+    def get_quant_mean_expanded(self) -> QuantizedTensorStorage:
+        """返回扩展到 [b*s, h] 的量化均值张量，用于权重梯度计算。"""
+        n = self.quant_input.size(0)
+        mean_expanded = self.input_tensor_mean_dim0.expand(n, -1).contiguous()
+        return self.quant_input._quantizer(mean_expanded)
+
+    def clear(self):
+        clear_tensor_data(self.quant_input, self.input_tensor_mean_dim0, self.cached_quant_mean_tensor)
+        self.shape = None
+
+
 class MetisMeanFunction:
     @staticmethod
     @torch.no_grad()
@@ -1883,28 +1943,30 @@ class MetisMeanFunction:
         )
     
     @staticmethod
-    def gemm_operation_with_mean_quant(quant_result: Union[MeanQuantResult,MeanSplitDimQuantResult], weight: torch.Tensor, 
-                                       activation_dtype: torch.dtype = None, 
+    def gemm_operation_with_mean_quant(quant_result: Union[MeanQuantResult, MeanSplitDimQuantResult, "MeanDim0QuantResult"], weight: torch.Tensor,
+                                       activation_dtype: torch.dtype = None,
                                        quantizer: "Quantizer" = None):
         """
         基于mean_quant输出的GEMM操作：out_final = out_0 - out_1
         其中 out_0 = quant_input @ weight.T
               out_1 = quant_mean @ weight.T
-        
+
+        对 MeanDim0QuantResult，均值张量 padding 到 64 后做 GEMM，仅取第一行结果广播相减。
+
         Args:
-            quant_result: MeanQuantResult对象，包含量化张量和形状信息
+            quant_result: MeanQuantResult / MeanSplitDimQuantResult / MeanDim0QuantResult 对象
             weight: 权重矩阵，shape为[out_features, h]
             activation_dtype: 激活数据类型
             quantizer: 量化器
-            
+
         Returns:
             out_final: 最终输出，根据input_shape和weight shape推断输出形状
         """
-        # print("running gemm_operation_with_mean_quant ")
         # 从quant_result中提取数据
         quant_input = quant_result.quant_input  # [b*s, h]
-        if isinstance(quant_result, MeanSplitDimQuantResult):
-            quant_mean = quant_result.get_quant_mean_tensor()
+        is_dim0 = isinstance(quant_result, MeanDim0QuantResult)
+        if isinstance(quant_result, (MeanSplitDimQuantResult, MeanDim0QuantResult)):
+            quant_mean = quant_result.get_quant_mean_tensor()  # [b*s, h] 或 [64, h]
         else:
             quant_mean = quant_result.quant_mean    # [b, h]
         input_shape = quant_result.shape  # (b, s, h) or (b,h)
@@ -1912,54 +1974,49 @@ class MetisMeanFunction:
         output_shape = list(input_shape)
         output_shape[-1] = weight.size(0) if hasattr(weight, 'size') else weight.shape[0]
 
-        # 从形状信息推断维度
-        # batch_size = input_shape[0]
-        # seq_len = input_shape[1]
-        # out_features = weight.shape[0]
-        
         # 使用TE的GEMM接口计算out_0: [b*s, h] @ [h, out_features]^T -> [b*s, out_features]
         out_0 = MetisSvdFunction.svd_quant_gemm(
-            weight, quant_input, activation_dtype, 
+            weight, quant_input, activation_dtype,
             quantizer, layout="TN", nvtx_label="input@weight"
         )  # [b*s, out_features]
-        
-        # 使用TE的GEMM接口计算out_1: [b, h] @ [h, out_features]^T -> [b, out_features]
+
+        # 使用TE的GEMM接口计算out_1: quant_mean @ weight.T
         out_1 = MetisSvdFunction.svd_quant_gemm(
-            weight, quant_mean, activation_dtype, 
+            weight, quant_mean, activation_dtype,
             quantizer, layout="TN", nvtx_label="mean@weight"
-        )  # [1, out_features]
-        # unpad out_1
-        # out_1 = out_1[0,:]
-        # out_1 = out_1.unsqueeze(0)
-        # 根据input_shape推断输出形状并重塑
-        # output_shape = (batch_size, seq_len, out_features)
-        
+        )
+        # MeanDim0QuantResult: quant_mean 为 [64, h]，GEMM 结果为 [64, out_features]，仅取第一行广播相减
+        if is_dim0:
+            out_1 = out_1[0:1, :]  # [1, out_features]
+
         # 计算最终输出：out_final = out_0 - out_1
-        out_final = out_0 - out_1  # [b * s, out_features]
+        out_final = out_0 - out_1  # [b*s, out_features]
 
         out_final = out_final.view(output_shape)  # [b, s, out_features]
-        
+
         return out_final
     
     @staticmethod
-    def compute_input_gradient_mean(grad_output_result: Union[MeanQuantResult, MeanSplitDimQuantResult], weight: torch.Tensor, 
-                              activation_dtype: torch.dtype = None, 
+    def compute_input_gradient_mean(grad_output_result: Union[MeanQuantResult, MeanSplitDimQuantResult, "MeanDim0QuantResult"], weight: torch.Tensor,
+                              activation_dtype: torch.dtype = None,
                               quantizer: "Quantizer" = None):
         """
-        计算输入梯度：dx = dout @ weight
-        
+        计算输入梯度：dx = (dout - dout_mean) @ weight
+
+        对 MeanDim0QuantResult，均值 GEMM 结果为 [64, h]，仅取第一行广播相减。
+
         Args:
-            dout: 输出梯度，shape为[b, s, out_features]
+            grad_output_result: MeanQuantResult / MeanSplitDimQuantResult / MeanDim0QuantResult 对象
             weight: 权重矩阵，shape为[out_features, h]
             activation_dtype: 激活数据类型
             quantizer: 量化器
-            
+
         Returns:
             dx: 输入梯度，shape为[b, s, h]
         """
-        if isinstance(grad_output_result, MeanSplitDimQuantResult):
-            quant_mean = grad_output_result.get_quant_mean_tensor()
-            
+        is_dim0 = isinstance(grad_output_result, MeanDim0QuantResult)
+        if isinstance(grad_output_result, (MeanSplitDimQuantResult, MeanDim0QuantResult)):
+            quant_mean = grad_output_result.get_quant_mean_tensor()  # [b*s, h] 或 [64, out_features]
         elif isinstance(grad_output_result, MeanQuantResult):
             quant_mean = grad_output_result.quant_mean
         else:
@@ -1970,20 +2027,22 @@ class MetisMeanFunction:
         input_shape = list(grad_output_result.shape)
         hidden_size = weight.size(1) if hasattr(weight, 'size') else weight.shape[1]
         input_shape[-1] = hidden_size
-        
+
         # 计算输入梯度：dx = dout @ weight
         dx = MetisSvdFunction.svd_quant_gemm(
-            weight, quant_input, activation_dtype, 
+            weight, quant_input, activation_dtype,
             quantizer, layout="NN", grad=True, nvtx_label="dout@weight"
         )  # [b*s, h]
 
         dx_mean = MetisSvdFunction.svd_quant_gemm(
-            weight,quant_mean, activation_dtype, 
-            quantizer, layout="NN", grad=True, nvtx_label="dout@weight"
-        )  # [1, h]
-        # dx_mean = dx_mean[0,:]
-        # dx_mean = dx_mean.unsqueeze(0)
-        dx_final = dx - dx_mean  # [b, s, h]
+            weight, quant_mean, activation_dtype,
+            quantizer, layout="NN", grad=True, nvtx_label="dout_mean@weight"
+        )
+        # MeanDim0QuantResult: quant_mean 为 [64, out_features]，GEMM 结果为 [64, h]，仅取第一行广播相减
+        if is_dim0:
+            dx_mean = dx_mean[0:1, :]  # [1, h]
+
+        dx_final = dx - dx_mean
         dx_final = dx_final.view(input_shape)
 
         return dx_final
@@ -2029,41 +2088,44 @@ class MetisMeanFunction:
         return dx_final
     
     @staticmethod
-    def compute_weight_gradient_mean(x_quant:Union[MeanQuantResult, MeanSplitDimQuantResult],
-                                     dy_quant: Union[MeanQuantResult, MeanSplitDimQuantResult],
-                                     activation_dtype: torch.dtype = None, 
+    def compute_weight_gradient_mean(x_quant: Union[MeanQuantResult, MeanSplitDimQuantResult, "MeanDim0QuantResult"],
+                                     dy_quant: Union[MeanQuantResult, MeanSplitDimQuantResult, "MeanDim0QuantResult"],
+                                     activation_dtype: torch.dtype = None,
                                      quantizer: "Quantizer" = None):
         """
         计算权重梯度：
                     dw = dy.T @ x
                        = (dy - dy_mean).T @ (x - x_mean)
                        = (dy.T @ x) - (dy.T @ x_mean) - (dy_mean.T @ x) + (dy_mean.T @ x_mean)
-        Args:           
-            x_quant: 输入的MeanQuantResult对象，包含量化张量和形状信息
-            dy_quant: 输出梯度的MeanQuantResult对象，包含量化张量和形状信息
+
+        对 MeanDim0QuantResult，使用 get_quant_mean_expanded() 扩展均值到 [b*s, h] 以匹配 NT GEMM 尺寸。
+
+        Args:
+            x_quant: MeanQuantResult / MeanSplitDimQuantResult / MeanDim0QuantResult 对象
+            dy_quant: MeanQuantResult / MeanSplitDimQuantResult / MeanDim0QuantResult 对象
             activation_dtype: 激活数据类型
             quantizer: 量化器
-            
+
         Returns:
             dw: 权重梯度，shape为[out_features, h]
         """
         # 从x_quant中提取输入数据
-        if isinstance(x_quant, MeanSplitDimQuantResult):
-            x_quant_input = x_quant.quant_input
-            x_quant_mean = x_quant.get_quant_mean_tensor()
+        x_quant_input = x_quant.quant_input  # [b*s, h]
+        if isinstance(x_quant, MeanDim0QuantResult):
+            x_quant_mean = x_quant.get_quant_mean_expanded()   # [b*s, h]
+        elif isinstance(x_quant, MeanSplitDimQuantResult):
+            x_quant_mean = x_quant.get_quant_mean_tensor()     # [b*s, h]
         else:
-            x_quant_input = x_quant.quant_input  # [b*s, h]
-            x_quant_mean = x_quant.quant_mean    # [b, h]
-        # x_shape = x_quant.shape  # (b, s, h)
-        
+            x_quant_mean = x_quant.quant_mean                  # [b, h]
+
         # 从dy_quant中提取梯度数据
-        if isinstance(dy_quant, MeanSplitDimQuantResult):
-            dy_quant_input = dy_quant.quant_input
-            dy_quant_mean = dy_quant.get_quant_mean_tensor()
+        dy_quant_input = dy_quant.quant_input  # [b*s, out_features]
+        if isinstance(dy_quant, MeanDim0QuantResult):
+            dy_quant_mean = dy_quant.get_quant_mean_expanded()  # [b*s, out_features]
+        elif isinstance(dy_quant, MeanSplitDimQuantResult):
+            dy_quant_mean = dy_quant.get_quant_mean_tensor()    # [b*s, out_features]
         else:
-            dy_quant_input = dy_quant.quant_input  # [b*s, out_features]
-            dy_quant_mean = dy_quant.quant_mean    # [b, out_features]
-        # dy_shape = dy_quant.shape  # (b, s, out_features)
+            dy_quant_mean = dy_quant.quant_mean                 # [b, out_features]
         
         # 根据公式计算四项：
         # dw = (dy.T @ x) - (dy.T @ x_mean) - (dy_mean.T @ x) + (dy_mean.T @ x_mean)
@@ -2149,8 +2211,10 @@ class MetisMeanFunction:
         Computes: out_i = (quant_input_i - quant_mean_i) @ weight_i.T
                         = (quant_input_i @ weight_i.T) - (quant_mean_i @ weight_i.T)
 
+        对 MeanDim0QuantResult，均值 GEMM 结果为 [64, out_i]，仅取第一行广播相减。
+
         Args:
-            quant_results:    List[MeanQuantResult | MeanSplitDimQuantResult] per split.
+            quant_results:    List[MeanQuantResult | MeanSplitDimQuantResult | MeanDim0QuantResult] per split.
             weight_list:      List[Tensor] quantized weight matrices per split.
             activation_dtype: Output dtype.
             m_splits:         List[int] token counts per split.
@@ -2176,7 +2240,7 @@ class MetisMeanFunction:
         qi_list = [quant_results[i].quant_input for i in active]
         qm_list = [
             quant_results[i].get_quant_mean_tensor()
-            if isinstance(quant_results[i], MeanSplitDimQuantResult)
+            if isinstance(quant_results[i], (MeanSplitDimQuantResult, MeanDim0QuantResult))
             else quant_results[i].quant_mean
             for i in active
         ]
@@ -2216,7 +2280,11 @@ class MetisMeanFunction:
         # Combine and reshape
         active_out = {}
         for k, i in enumerate(active):
-            out_final = out0_list[k] - out1_list[k]
+            out_1 = out1_list[k]
+            # MeanDim0QuantResult: 均值 GEMM 结果为 [64, out_i]，仅取第一行广播相减
+            if isinstance(quant_results[i], MeanDim0QuantResult):
+                out_1 = out_1[0:1, :]  # [1, out_i]
+            out_final = out0_list[k] - out_1
             output_shape = list(quant_results[i].shape)
             output_shape[-1] = weight_list[i].size(0)
             active_out[i] = out_final.view(output_shape)
@@ -2248,8 +2316,10 @@ class MetisMeanFunction:
         Computes: dx_i = (quant_grad_i - quant_grad_mean_i) @ weight_i
                         = (quant_grad_i @ weight_i) - (quant_grad_mean_i @ weight_i)
 
+        对 MeanDim0QuantResult，均值 GEMM 结果为 [64, h]，仅取第一行广播相减。
+
         Args:
-            grad_output_results: List[MeanQuantResult | MeanSplitDimQuantResult] per split.
+            grad_output_results: List[MeanQuantResult | MeanSplitDimQuantResult | MeanDim0QuantResult] per split.
             weight_list:         List[Tensor] quantized weight matrices per split.
             activation_dtype:    Output dtype.
             m_splits:            List[int] token counts per split.
@@ -2274,7 +2344,7 @@ class MetisMeanFunction:
         qi_list = [grad_output_results[i].quant_input for i in active]
         qm_list = [
             grad_output_results[i].get_quant_mean_tensor()
-            if isinstance(grad_output_results[i], MeanSplitDimQuantResult)
+            if isinstance(grad_output_results[i], (MeanSplitDimQuantResult, MeanDim0QuantResult))
             else grad_output_results[i].quant_mean
             for i in active
         ]
@@ -2312,7 +2382,11 @@ class MetisMeanFunction:
         # Combine and reshape
         active_out = {}
         for k, i in enumerate(active):
-            dx_final = dx_list[k] - dx_mean_list[k]
+            dx_mean = dx_mean_list[k]
+            # MeanDim0QuantResult: 均值 GEMM 结果为 [64, h]，仅取第一行广播相减
+            if isinstance(grad_output_results[i], MeanDim0QuantResult):
+                dx_mean = dx_mean[0:1, :]  # [1, h]
+            dx_final = dx_list[k] - dx_mean
             input_shape = list(grad_output_results[i].shape)
             hidden_size = weight_list[i].size(1)
             input_shape[-1] = hidden_size
@@ -2348,10 +2422,11 @@ class MetisMeanFunction:
                - (dy_mean_i.T @ x_input_i)  + (dy_mean_i.T @ x_mean_i)
 
         All 4 terms use layout "NT" and can be issued as 4 grouped_gemm calls.
+        对 MeanDim0QuantResult，使用 get_quant_mean_expanded() 扩展均值到 [b*s, h]。
 
         Args:
-            x_quant_list:     List[MeanQuantResult | MeanSplitDimQuantResult] forward quant per split.
-            dy_quant_list:    List[MeanQuantResult | MeanSplitDimQuantResult] grad quant per split.
+            x_quant_list:     List[MeanQuantResult | MeanSplitDimQuantResult | MeanDim0QuantResult] forward quant per split.
+            dy_quant_list:    List[MeanQuantResult | MeanSplitDimQuantResult | MeanDim0QuantResult] grad quant per split.
             activation_dtype: Output dtype.
             m_splits:         List[int] token counts per split.
             quantizer_list:   Optional list of output quantizers (currently unused).
@@ -2384,19 +2459,21 @@ class MetisMeanFunction:
             dy_q = dy_quant_list[i]
 
             xi_list.append(x_q.quant_input)
-            xi_mean = (
-                x_q.get_quant_mean_tensor()
-                if isinstance(x_q, MeanSplitDimQuantResult)
-                else x_q.quant_mean
-            )
+            if isinstance(x_q, MeanDim0QuantResult):
+                xi_mean = x_q.get_quant_mean_expanded()   # [b*s, h]
+            elif isinstance(x_q, MeanSplitDimQuantResult):
+                xi_mean = x_q.get_quant_mean_tensor()     # [b*s, h]
+            else:
+                xi_mean = x_q.quant_mean
             xm_list.append(xi_mean)
 
             dyi_list.append(dy_q.quant_input)
-            dyi_mean = (
-                dy_q.get_quant_mean_tensor()
-                if isinstance(dy_q, MeanSplitDimQuantResult)
-                else dy_q.quant_mean
-            )
+            if isinstance(dy_q, MeanDim0QuantResult):
+                dyi_mean = dy_q.get_quant_mean_expanded()  # [b*s, out_features]
+            elif isinstance(dy_q, MeanSplitDimQuantResult):
+                dyi_mean = dy_q.get_quant_mean_tensor()    # [b*s, out_features]
+            else:
+                dyi_mean = dy_q.quant_mean
             dym_list.append(dyi_mean)
 
         # All 4 terms share layout "NT", grad=True
@@ -2443,3 +2520,43 @@ class MetisMeanFunction:
             else:
                 result.append(active_out[i])
         return result
+
+    # -----------------------------------------------------------------------
+    # MeanDim0Only 方法组：只对 dim=0 计算均值的量化策略
+    # quantization_strategy = mean_dim0_only
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    @torch.no_grad()
+    def mean_dim0_only_quant(
+        input_tensor: torch.Tensor,
+        quantizer: "Quantizer",
+    ) -> "MeanDim0QuantResult":
+        """仅对 dim=0 计算均值并量化输入张量。
+
+        Args:
+            input_tensor: 输入张量，shape 为 [b, s, h] 或 [b*s, h]。
+            quantizer:    量化器。
+
+        Returns:
+            MeanDim0QuantResult: 包含量化后输入、dim=0 均值以及原始形状。
+        """
+        input_shape = input_tensor.shape  # (b, s, h) 或 (b*s, h)
+        hidden_size = input_shape[-1]
+
+        # 转为 2D
+        input_tensor_2d = input_tensor.view(-1, hidden_size)  # [b*s, h]
+
+        # 仅对 dim=0 计算均值：列均值
+        input_tensor_mean_dim0 = input_tensor_2d.mean(dim=0, keepdim=True)  # [1, h]
+
+        # 量化输入张量
+        quant_x = quantizer(input_tensor_2d)  # [b*s, h]
+
+        return MeanDim0QuantResult(
+            quant_input=quant_x,
+            input_tensor_mean_dim0=input_tensor_mean_dim0,
+            shape=input_shape,
+        )
+
+    
