@@ -73,6 +73,177 @@ def run_forward_backward(module, inp, m_splits, fp8, recipe_obj=None):
 
 
 # ---------------------------------------------------------------------------
+# MEAN_DIM0_ONLY strategy tests (requires NVFP4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not nvfp4_available, reason=reason_for_no_nvfp4)
+class TestMetisGroupedLinearMeanDim0Only:
+    """Tests for MEAN_DIM0_ONLY quantization strategy with NVFP4."""
+
+    @pytest.mark.parametrize("num_gemms", [2, 4])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16])
+    @pytest.mark.parametrize("bias", [False, True])
+    def test_mean_dim0_only_forward_backward_runs(self, num_gemms, dtype, bias):
+        """Verify MEAN_DIM0_ONLY strategy forward + backward runs without error."""
+        reset_rng_states()
+        device = "cuda"
+        in_features = 128
+        out_features = 256
+
+        total_rows = ALIGN * (num_gemms - 1) * 2
+        m_splits = make_m_splits(total_rows, num_gemms)
+
+        module = GroupedLinear(
+            num_gemms=num_gemms,
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias and (num_gemms == 1),
+            params_dtype=dtype,
+            parallel_mode=None,
+            device=device,
+            enable_metis=True,
+        ).train()
+
+        nvfp4_rec = get_nvfp4_recipe()
+        inp = torch.randn(total_rows, in_features, dtype=dtype, device=device)
+
+        with get_metis_context(
+            use_metis=True,
+            quantization_strategy="mean_dim0_only",
+            enable_activation_svd=False,
+            enable_backward_svd=True,
+        ):
+            out, dgrad = run_forward_backward(module, inp, m_splits, fp8=True, recipe_obj=nvfp4_rec)
+
+        assert out.shape == (total_rows, out_features), f"Output shape mismatch: {out.shape}"
+        assert dgrad is not None, "Input gradient should not be None"
+        assert dgrad.shape == (total_rows, in_features), f"Grad shape mismatch: {dgrad.shape}"
+        assert not torch.isnan(out).any(), "Output contains NaN"
+        assert not torch.isnan(dgrad).any(), "Input grad contains NaN"
+
+    @pytest.mark.parametrize("num_gemms", [2, 3])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16])
+    def test_mean_dim0_only_weight_grad_exists(self, num_gemms, dtype):
+        """Verify that weight gradients are computed under MEAN_DIM0_ONLY strategy."""
+        reset_rng_states()
+        device = "cuda"
+        in_features = 128
+        out_features = 128
+
+        total_rows = ALIGN * num_gemms * 2
+        m_splits = make_m_splits(total_rows, num_gemms)
+
+        module = GroupedLinear(
+            num_gemms=num_gemms,
+            in_features=in_features,
+            out_features=out_features,
+            bias=False,
+            params_dtype=dtype,
+            parallel_mode=None,
+            device=device,
+            enable_metis=True,
+        ).train()
+
+        nvfp4_rec = get_nvfp4_recipe()
+        inp = torch.randn(total_rows, in_features, dtype=dtype, device=device)
+
+        with get_metis_context(
+            use_metis=True,
+            quantization_strategy="mean_dim0_only",
+            enable_activation_svd=False,
+            enable_backward_svd=True,
+        ):
+            out, _ = run_forward_backward(module, inp, m_splits, fp8=True, recipe_obj=nvfp4_rec)
+
+        for i in range(num_gemms):
+            weight = getattr(module, f"weight{i}")
+            assert weight.grad is not None, f"weight{i}.grad should not be None"
+            assert not torch.isnan(weight.grad).any(), f"weight{i}.grad contains NaN"
+
+    @pytest.mark.parametrize("num_gemms", [2])
+    def test_mean_dim0_only_output_shape_matches_standard(self, num_gemms):
+        """Verify Metis MEAN_DIM0_ONLY output shape matches standard path output shape."""
+        reset_rng_states()
+        device = "cuda"
+        dtype = torch.bfloat16
+        in_features = 128
+        out_features = 256
+        total_rows = ALIGN * num_gemms * 2
+        m_splits = make_m_splits(total_rows, num_gemms)
+
+        nvfp4_rec = get_nvfp4_recipe()
+
+        # Standard path
+        reset_rng_states()
+        module_std = GroupedLinear(
+            num_gemms=num_gemms, in_features=in_features, out_features=out_features,
+            bias=False, params_dtype=dtype, parallel_mode=None, device=device, enable_metis=True,
+        ).eval()
+
+        # Metis MEAN_DIM0_ONLY path (same weights)
+        reset_rng_states()
+        module_metis = GroupedLinear(
+            num_gemms=num_gemms, in_features=in_features, out_features=out_features,
+            bias=False, params_dtype=dtype, parallel_mode=None, device=device, enable_metis=True,
+        ).eval()
+        with torch.no_grad():
+            for i in range(num_gemms):
+                getattr(module_metis, f"weight{i}").copy_(getattr(module_std, f"weight{i}"))
+
+        inp = torch.randn(total_rows, in_features, dtype=dtype, device=device)
+
+        with te.autocast(enabled=True, recipe=nvfp4_rec):
+            with get_metis_context(use_metis=False):
+                out_std = module_std(inp, m_splits)
+            with get_metis_context(use_metis=True, quantization_strategy="mean_dim0_only",
+                                   enable_activation_svd=False, enable_backward_svd=False):
+                out_metis = module_metis(inp, m_splits)
+
+        assert out_metis.shape == out_std.shape, (
+            f"Shape mismatch: metis={out_metis.shape}, std={out_std.shape}"
+        )
+
+    @pytest.mark.parametrize("num_gemms", [2])
+    def test_mean_dim0_only_multi_step_training(self, num_gemms):
+        """Simulate multiple training steps with MEAN_DIM0_ONLY strategy."""
+        reset_rng_states()
+        device = "cuda"
+        dtype = torch.bfloat16
+        in_features = 64
+        out_features = 64
+        total_rows = ALIGN * num_gemms * 2
+        m_splits = make_m_splits(total_rows, num_gemms)
+        nvfp4_rec = get_nvfp4_recipe()
+
+        module = GroupedLinear(
+            num_gemms=num_gemms, in_features=in_features, out_features=out_features,
+            bias=False, params_dtype=dtype, parallel_mode=None, device=device,
+        ).train()
+
+        optimizer = torch.optim.SGD(module.parameters(), lr=1e-3)
+
+        for step in range(3):
+            optimizer.zero_grad()
+            torch.manual_seed(step + 100)
+            inp = torch.randn(total_rows, in_features, dtype=dtype, device=device)
+
+            with get_metis_context(use_metis=True, quantization_strategy="mean_dim0_only",
+                                   enable_activation_svd=False, enable_backward_svd=True):
+                with te.autocast(enabled=True, recipe=nvfp4_rec):
+                    out = module(inp, m_splits)
+
+            loss = out.sum()
+            loss.backward()
+            optimizer.step()
+            torch.cuda.synchronize()
+
+            assert not torch.isnan(out).any(), f"Output NaN at step {step}"
+            for i in range(num_gemms):
+                w = getattr(module, f"weight{i}")
+                assert w.grad is not None, f"weight{i}.grad is None at step {step}"
+
+
+# ---------------------------------------------------------------------------
 # MEAN strategy tests (requires NVFP4)
 # ---------------------------------------------------------------------------
 
@@ -437,6 +608,15 @@ if __name__ == "__main__":
     # print("Context isolation: PASSED")
 
     if nvfp4_available:
+        # MEAN_DIM0_ONLY strategy
+        t_mean_dim0 = TestMetisGroupedLinearMeanDim0Only()
+        t_mean_dim0.test_mean_dim0_only_forward_backward_runs(num_gemms=8, dtype=torch.bfloat16, bias=False)
+        print("MEAN_DIM0_ONLY forward/backward (num_gemms=8): PASSED")
+        t_mean_dim0.test_mean_dim0_only_weight_grad_exists(num_gemms=8, dtype=torch.bfloat16)
+        print("MEAN_DIM0_ONLY weight grad (num_gemms=8): PASSED")
+        t_mean_dim0.test_mean_dim0_only_output_shape_matches_standard(num_gemms=2)
+        print("MEAN_DIM0_ONLY output shape: PASSED")
+
         # MEAN strategy
         t_mean = TestMetisGroupedLinearMean()
         t_mean.test_mean_forward_backward_runs(num_gemms=8, dtype=torch.bfloat16, bias=False)

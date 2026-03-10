@@ -180,6 +180,8 @@ class _MetisLinear(torch.autograd.Function):
                 ), "DelayedScaling recipe is not supported with save_original_input"
         # print(f"use_metis=={use_metis},LinearLowbitContext=", LinearLowbitContext())
         input_ug_sg, input_vg, input_res, input_restore_info = None, None, None, None
+        mean_split_dim_quant_result = None
+        mean_dim0_only_quant_result = None
         if current_forward_use_metis and fp8 and LinearLowbitContext.quantization_strategy == QuantizationStrategy.SEPARATE_RESIDUAL:
             # ------------------------------------------------------
             # Forward x SVD
@@ -206,6 +208,8 @@ class _MetisLinear(torch.autograd.Function):
             )
         elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN:
             mean_split_dim_quant_result = MetisMeanFunction.mean_split_dim_quant(inputmat, input_quantizer)
+        elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+            mean_dim0_only_quant_result = MetisMeanFunction.mean_dim0_only_quant(inputmat, input_quantizer)
         else:
             raise ValueError("Unsupported quantization strategy " + LinearLowbitContext.quantization_strategy)
         
@@ -221,7 +225,12 @@ class _MetisLinear(torch.autograd.Function):
         #     inputmat_total = inputmat
 
         if is_cpu_offload_enabled():
-            start_offload(input_ug_sg, input_vg, input_res)
+            if LinearLowbitContext.quantization_strategy == QuantizationStrategy.SEPARATE_RESIDUAL:
+                start_offload(input_ug_sg, input_vg, input_res)
+            elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN:
+                start_offload(mean_split_dim_quant_result)
+            elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                start_offload(mean_dim0_only_quant_result)
         nvtx_range_pop(f"{nvtx_label}.input_cast_comm")
         # ------------------------------------------------------
         # Input tensor is ready for GEMM...
@@ -313,6 +322,8 @@ class _MetisLinear(torch.autograd.Function):
             )
         elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN:
             gemm_out = MetisMeanFunction.gemm_operation_with_mean_quant(mean_split_dim_quant_result, weightmat, activation_dtype, None)
+        elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+            gemm_out = MetisMeanFunction.gemm_operation_with_mean_quant(mean_dim0_only_quant_result, weightmat, activation_dtype, None)
         else:
             raise ValueError("Unsupported quantization strategy " + LinearLowbitContext.quantization_strategy)
         nvtx_range_pop(f"{nvtx_label}.gemm")
@@ -380,8 +391,13 @@ class _MetisLinear(torch.autograd.Function):
             # if backward_needs_input:
             #     saved_inputmat = inputmat
 
-            if cpu_offloading and input_ug_sg and input_vg and input_res:
-                mark_activation_offload(input_ug_sg, input_vg, input_res)
+            if cpu_offloading:
+                if LinearLowbitContext.quantization_strategy == QuantizationStrategy.SEPARATE_RESIDUAL and input_ug_sg and input_vg and input_res:
+                    mark_activation_offload(input_ug_sg, input_vg, input_res)
+                elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN and mean_split_dim_quant_result:
+                    mark_activation_offload(mean_split_dim_quant_result)
+                elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY and mean_dim0_only_quant_result:
+                    mark_activation_offload(mean_dim0_only_quant_result)
 
             # Scatter intermediate/activation tensors saved for the backward pass
             # NOTE: FSDP sharding is not valid for models initialized with primary Fp8 weights
@@ -419,6 +435,13 @@ class _MetisLinear(torch.autograd.Function):
             elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN:
                 tensors_to_save, tensor_objects = prepare_for_saving(
                     mean_split_dim_quant_result,
+                    weightmat,
+                    weight,
+                    bias,
+                )   
+            elif LinearLowbitContext.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                tensors_to_save, tensor_objects = prepare_for_saving(
+                    mean_dim0_only_quant_result,
                     weightmat,
                     weight,
                     bias,
@@ -507,6 +530,8 @@ class _MetisLinear(torch.autograd.Function):
                 ) = restore_from_saved(  # pylint: disable=unbalanced-tuple-unpacking
                     ctx.tensor_objects, saved_tensors
                 )
+                input_mean_quant_tensor = None
+                input_mean_dim0_only_quant_tensor = None
             elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN:
                 saved_tensors = ctx.saved_tensors
                 (
@@ -517,6 +542,20 @@ class _MetisLinear(torch.autograd.Function):
                 ) = restore_from_saved(  # pylint: disable=unbalanced-tuple-unpacking
                     ctx.tensor_objects, saved_tensors
                 )
+                input_ug_sg, input_vg, input_res = None, None, None
+                input_mean_dim0_only_quant_tensor = None
+            elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                saved_tensors = ctx.saved_tensors
+                (
+                    input_mean_dim0_only_quant_tensor,
+                    weight_fp8,
+                    weight,
+                    bias,
+                ) = restore_from_saved(  # pylint: disable=unbalanced-tuple-unpacking
+                    ctx.tensor_objects, saved_tensors
+                )
+                input_ug_sg, input_vg, input_res = None, None, None
+                input_mean_quant_tensor = None
             else:
                 raise ValueError("Unsupported quantization strategy " + ctx.metis_context.quantization_strategy)
             # Delete the references to tensor objects once they've been consumed
@@ -616,6 +655,9 @@ class _MetisLinear(torch.autograd.Function):
             #     ctx.parallel_mode == "row",
             #     ctx.grad_output_quantizer,
             # )
+            output_grad_ug_sg, output_grad_vg, output_grad_res, output_grad_restore_info = None, None, None, None
+            grad_output_mean_quant_result = None
+            grad_output_mean_dim0_only_quant_result = None
             if ctx.enable_metis and ctx.metis_context.use_metis and ctx.metis_context.enable_backward_svd:
                 if ctx.metis_context.backward_lowrank_svd > 0 and ctx.metis_context.quantization_strategy == QuantizationStrategy.SEPARATE_RESIDUAL:
                     grad_output_shape = grad_output.shape
@@ -644,6 +686,8 @@ class _MetisLinear(torch.autograd.Function):
                 #     grad_output_mean_quant_result = MetisMeanFunction.mean_split_dim_quant(grad_output, ctx.grad_output_quantizer,)
                 elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN:
                     grad_output_mean_quant_result = MetisMeanFunction.mean_quant(grad_output, ctx.grad_output_quantizer,)
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                    grad_output_mean_dim0_only_quant_result = MetisMeanFunction.mean_dim0_only_quant(grad_output, ctx.grad_output_quantizer)
                 else:
                     raise ValueError("Unsupported quantization strategy " + ctx.metis_context.quantization_strategy)
             nvtx_range_pop(f"{nvtx_label}.grad_output_preprocess")
@@ -720,6 +764,8 @@ class _MetisLinear(torch.autograd.Function):
                     )
                 elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN:
                     gemm_out = MetisMeanFunction.compute_input_gradient_mean(grad_output_mean_quant_result,weight_fp8,ctx.activation_dtype,None,)
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                    gemm_out = MetisMeanFunction.compute_input_gradient_mean(grad_output_mean_dim0_only_quant_result,weight_fp8,ctx.activation_dtype,None,)
                 else:
                     raise ValueError("Unsupported quantization strategy " + ctx.metis_context.quantization_strategy)
                 nvtx_range_pop(f"{nvtx_label}.dgrad_gemm")
@@ -934,6 +980,10 @@ class _MetisLinear(torch.autograd.Function):
                     # if ctx.owns_input:
                     clear_tensor_data(grad_output_mean_quant_result)
                     clear_tensor_data(input_mean_quant_tensor)
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                    wgrad = MetisMeanFunction.compute_weight_gradient_mean(input_mean_dim0_only_quant_tensor,grad_output_mean_dim0_only_quant_result,ctx.activation_dtype, ctx.grad_weight_quantizer,)
+                    clear_tensor_data(grad_output_mean_dim0_only_quant_result)
+                    clear_tensor_data(input_mean_dim0_only_quant_tensor)
                 else:
                     raise ValueError("Unsupported quantization strategy " + ctx.metis_context.quantization_strategy)
                     # wgrad = ctx.grad_weight_quantizer(wgrad)
