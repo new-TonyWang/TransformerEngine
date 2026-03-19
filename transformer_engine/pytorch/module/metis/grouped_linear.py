@@ -170,6 +170,13 @@ class _MetisGroupedLinear(torch.autograd.Function):
                 quantizer = input_quantizers[i]
                 result = MetisMeanFunction.mean_split_dim_quant(split, quantizer)
                 mean_quant_results.append(result)
+        elif metis_ctx.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+            mean_dim0_only_quant_results = []
+            for i in range(num_gemms):
+                split = inp_splits[i]
+                quantizer = input_quantizers[i]
+                result = MetisMeanFunction.mean_dim0_only_quant(split, quantizer)
+                mean_dim0_only_quant_results.append(result)
         else:
             raise ValueError(
                 f"Unsupported quantization strategy: {metis_ctx.quantization_strategy}"
@@ -244,6 +251,17 @@ class _MetisGroupedLinear(torch.autograd.Function):
                 for i in range(num_gemms):
                     if m_splits[i] > 0:
                         out_parts[i] = out_parts[i] + biases[i]
+        elif metis_ctx.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+            out_parts = MetisMeanFunction.grouped_gemm_operation_with_mean_quant(
+                mean_dim0_only_quant_results,
+                weights_fp8,
+                activation_dtype,
+                list(m_splits),
+            )
+            if use_bias:
+                for i in range(num_gemms):
+                    if m_splits[i] > 0:
+                        out_parts[i] = out_parts[i] + biases[i]
         nvtx_range_pop("_MetisGroupedLinear.forward.gemm")
 
         out = torch.cat(out_parts, dim=0)
@@ -272,6 +290,14 @@ class _MetisGroupedLinear(torch.autograd.Function):
                 ctx.restore_info_list = None
                 tensors_to_save, tensor_objects = prepare_for_saving(
                     *mean_quant_results,
+                    *weights_fp8,
+                    *weights,
+                    *biases,
+                )
+            elif metis_ctx.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                ctx.restore_info_list = None
+                tensors_to_save, tensor_objects = prepare_for_saving(
+                    *mean_dim0_only_quant_results,
                     *weights_fp8,
                     *weights,
                     *biases,
@@ -333,6 +359,13 @@ class _MetisGroupedLinear(torch.autograd.Function):
                 weights_fp8 = list(saved_tensors[N : 2 * N])
                 weights = list(saved_tensors[2 * N : 3 * N])
                 biases = list(saved_tensors[3 * N : 4 * N])
+                mean_dim0_only_quant_results = [None] * N
+            elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                mean_dim0_only_quant_results = list(saved_tensors[: N])
+                weights_fp8 = list(saved_tensors[N : 2 * N])
+                weights = list(saved_tensors[2 * N : 3 * N])
+                biases = list(saved_tensors[3 * N : 4 * N])
+                mean_quant_results = [None] * N
             else:
                 raise ValueError(
                     f"Unsupported quantization strategy: {ctx.metis_context.quantization_strategy}"
@@ -357,6 +390,7 @@ class _MetisGroupedLinear(torch.autograd.Function):
             output_grad_res_list = [None] * N
             output_grad_restore_info_list = [None] * N
             grad_output_mean_quant_results = [None] * N
+            grad_output_mean_dim0_only_quant_results = [None] * N
 
             if ctx.enable_metis and ctx.metis_context.use_metis and ctx.metis_context.enable_backward_svd:
                 if (
@@ -401,6 +435,14 @@ class _MetisGroupedLinear(torch.autograd.Function):
                         quantizer = ctx.grad_output_quantizers[i]
                         result = MetisMeanFunction.mean_quant(grad_split, quantizer)
                         grad_output_mean_quant_results[i] = result
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                    for i in range(N):
+                        if ctx.m_splits[i] == 0:
+                            continue
+                        grad_split = grad_output_splits[i]
+                        quantizer = ctx.grad_output_quantizers[i]
+                        result = MetisMeanFunction.mean_dim0_only_quant(grad_split, quantizer)
+                        grad_output_mean_dim0_only_quant_results[i] = result
             nvtx_range_pop("_MetisGroupedLinear.backward.grad_output_quant")
 
             # --------------------------------------------------
@@ -425,6 +467,13 @@ class _MetisGroupedLinear(torch.autograd.Function):
                 elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN:
                     dgrad_parts = MetisMeanFunction.compute_input_gradient_mean_grouped_gemm(
                         grad_output_mean_quant_results,
+                        weights_fp8,
+                        ctx.activation_dtype,
+                        list(ctx.m_splits),
+                    )
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                    dgrad_parts = MetisMeanFunction.compute_input_gradient_mean_grouped_gemm(
+                        grad_output_mean_dim0_only_quant_results,
                         weights_fp8,
                         ctx.activation_dtype,
                         list(ctx.m_splits),
@@ -458,6 +507,14 @@ class _MetisGroupedLinear(torch.autograd.Function):
                     wgrad_list = MetisMeanFunction.compute_weight_gradient_mean_grouped_gemm(
                         mean_quant_results,
                         grad_output_mean_quant_results,
+                        ctx.activation_dtype,
+                        list(ctx.m_splits),
+                        quantizer_list=ctx.grad_weight_quantizers,
+                    )
+                elif ctx.metis_context.quantization_strategy == QuantizationStrategy.MEAN_DIM0_ONLY:
+                    wgrad_list = MetisMeanFunction.compute_weight_gradient_mean_grouped_gemm(
+                        mean_dim0_only_quant_results,
+                        grad_output_mean_dim0_only_quant_results,
                         ctx.activation_dtype,
                         list(ctx.m_splits),
                         quantizer_list=ctx.grad_weight_quantizers,

@@ -150,6 +150,21 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count);
 
 /***************************************************************************************************
+ * NVFP4 GEMM
+ **************************************************************************************************/
+
+std::vector<py::object> nvfp4_gemm_bf16(py::handle A, bool transa, py::handle B, bool transb, py::object D,
+                             py::handle quantizer, std::optional<DType> out_dtype, MaybeTensor bias,
+                             DType bias_type, bool grad,
+                             at::Tensor workspace, size_t workspaceSize,
+                             bool accumulate, bool use_split_accumulator,
+                             float alpha = 1.0f, std::optional<float> beta = std::nullopt);
+
+// std::vector<py::object> nvfp4_gemm_nvfp4(py::handle A, py::handle B);
+
+// std::vector<at::Tensor> nvfp4_grouped_gemm(std::vector<py::handle> A_list, std::vector<py::handle> B_list);
+
+/***************************************************************************************************
  * Transpose
  **************************************************************************************************/
 
