@@ -41,8 +41,9 @@ def get_sign_from_vector(vector: torch.Tensor) -> int:
     """
     mask = 0
     for i, v in enumerate(vector):
-        mask |= (v == -1) << i
-    return mask.item()
+        # Use Python int to avoid bool tensor left-shift issue under torch.dynamo
+        mask |= int(v.item() == -1) << i
+    return mask
 
 
 def get_wgrad_sign_vector(device: int) -> torch.Tensor:

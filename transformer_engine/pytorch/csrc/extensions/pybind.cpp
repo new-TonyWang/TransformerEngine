@@ -124,6 +124,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("bgrad_quantize", transformer_engine::pytorch::bgrad_quantize,
         "Compute bias gradient and quantize", py::arg("input"), py::arg("quantizer"));
+  m.def("nvfp4_gemm_bf16", transformer_engine::pytorch::nvfp4_gemm_bf16,
+        "Compute NVFP4 GEMM with BF16 output using CUTLASS",
+        py::arg("A"), py::arg("transA"), py::arg("B"), py::arg("transB"), py::arg("D"),
+        py::arg("quantizer"), py::arg("output_dtype"), py::arg("bias"), py::arg("bias_type"),
+        py::arg("grad"), py::arg("workspace"), py::arg("workspace_size"),
+        py::arg("accumulate"), py::arg("use_split_accumulator"),
+        py::arg("alpha") = 1.0f, py::arg("beta") = std::nullopt);
   m.def("generic_gemm", transformer_engine::pytorch::gemm, "Compute GEMM (matrix-matrix multiply)",
         py::arg("A"), py::arg("transA"), py::arg("B"), py::arg("transB"), py::arg("D"),
         py::arg("quantizer"), py::arg("output_dtype"), py::arg("bias"), py::arg("bias_type"),

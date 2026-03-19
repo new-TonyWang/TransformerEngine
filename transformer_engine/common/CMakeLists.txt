@@ -15,7 +15,7 @@ endif()
 # Hide non-necessary symbols in shared object.
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libtransformer_engine.version")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libtransformer_engine.version")
-
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Transformer Engine library
 project(transformer_engine LANGUAGES CUDA CXX)
 
@@ -167,6 +167,7 @@ list(APPEND transformer_engine_cuda_sources
      comm_gemm_overlap/userbuffers/userbuffers.cu)
 
 list(APPEND transformer_engine_cuda_arch_specific_sources
+     gemm/cutlass_gemm_impl.cu
      gemm/cutlass_grouped_gemm.cu
      cast/cast.cu
      activation/gelu.cu
@@ -225,7 +226,9 @@ endif()
 
 add_library(transformer_engine SHARED ${transformer_engine_SOURCES})
 target_include_directories(transformer_engine PUBLIC
-                           "${CMAKE_CURRENT_SOURCE_DIR}/include")
+                           "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                           "/home/memx/miniforge3/envs/wty_metis/lib/python3.11/site-packages/nvidia/nccl/include/"
+                           )
 
 # CUTLASS kernels require SM90a and cause hang in debug build
 set_property(
@@ -233,6 +236,21 @@ set_property(
   APPEND
   PROPERTY
   COMPILE_OPTIONS "--generate-code=arch=compute_90a,code=sm_90a;-g0")
+
+# # CUTLASS SM120 BlockScaled NVFP4 GEMM requires sm_120a or sm_120f
+# if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.9)
+#   set_property(
+#     SOURCE gemm/cutlass_gemm_impl.cu
+#     APPEND
+#     PROPERTY
+#     COMPILE_OPTIONS "--generate-code=arch=compute_120,code=sm_120f")
+# else()
+#   set_property(
+#     SOURCE gemm/cutlass_gemm_impl.cu
+#     APPEND
+#     PROPERTY
+#     COMPILE_OPTIONS "--generate-code=arch=compute_120,code=sm_120a")
+# endif()
 
 # Configure dependencies
 target_link_libraries(transformer_engine PUBLIC

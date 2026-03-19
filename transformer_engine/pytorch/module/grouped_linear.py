@@ -53,6 +53,10 @@ from ..quantized_tensor import (
 from ...debug.pytorch.debug_quantization import DebugQuantizer
 from ...debug.pytorch.debug_state import TEDebugState
 
+from .metis.quant import MetisSvdFunction, MetisMeanFunction
+from .metis.metis_context import LinearLowbitContext, QuantizationStrategy
+from .metis.utils import TensorOffloadManager
+
 __all__ = ["GroupedLinear"]
 
 
@@ -608,6 +612,7 @@ class GroupedLinear(TransformerEngineBaseModule):
         delay_wgrad_compute: bool = False,
         save_original_input: bool = False,
         name: Optional[str] = None,
+        enable_metis: bool = False,
     ) -> None:
         super().__init__()
 
@@ -623,6 +628,8 @@ class GroupedLinear(TransformerEngineBaseModule):
         self.ub_overlap_ag = ub_overlap_ag
         self.ub_name = ub_name
         self.save_original_input = save_original_input
+        self.enable_metis = enable_metis
+        self.metis_tensor_history = [TensorOffloadManager() for _ in range(self.num_gemms)] 
         assert (
             not ub_overlap_rs and not ub_overlap_ag
         ), "GroupedLinear doesn't support Userbuffer overlap."
@@ -637,7 +644,7 @@ class GroupedLinear(TransformerEngineBaseModule):
             "fwd": 3,
             "bwd": 2,
         }
-
+        
         if tp_group is None:
             self.tp_size = tp_size
             if tp_size == 1:
@@ -817,29 +824,73 @@ class GroupedLinear(TransformerEngineBaseModule):
                 linear_fn = _GroupedLinear.forward
                 autograd_ctx = [None]
 
-            non_tensor_args = (
-                m_splits,
-                self.apply_bias,
-                is_first_microbatch,
-                self.fp8,
-                self.fp8_calibration,
-                self.wgrad_store,
-                input_quantizers,
-                weight_quantizers,
-                output_quantizers,
-                grad_input_quantizers,
-                grad_weight_quantizers,
-                grad_output_quantizers,
-                self.fuse_wgrad_accumulation,
-                is_cpu_offload_enabled(),
-                self.sequence_parallel,
-                self.activation_dtype,
-                is_grad_enabled,
-                self,
-                None,  # skip_fp8_weight_update
-                self.save_original_input,
-                debug,
+            # Check if Metis quantization should be used
+            use_metis_path = (
+                self.fp8
+                and self.enable_metis
+                and LinearLowbitContext.use_metis
+                and LinearLowbitContext.quantization_strategy != QuantizationStrategy.BASE
+                and not debug
             )
+            if use_metis_path:
+                from .metis import _MetisGroupedLinear
+                if is_grad_enabled:
+                    linear_fn = _MetisGroupedLinear.apply
+                    autograd_ctx = []
+                else:
+                    linear_fn = _MetisGroupedLinear.forward
+                    autograd_ctx = [None]
+
+            if use_metis_path:
+                non_tensor_args = (
+                    m_splits,
+                    self.apply_bias,
+                    is_first_microbatch,
+                    self.fp8,
+                    self.fp8_calibration,
+                    self.wgrad_store,
+                    input_quantizers,
+                    weight_quantizers,
+                    output_quantizers,
+                    grad_input_quantizers,
+                    grad_weight_quantizers,
+                    grad_output_quantizers,
+                    self.fuse_wgrad_accumulation,
+                    is_cpu_offload_enabled(),
+                    self.sequence_parallel,
+                    self.activation_dtype,
+                    is_grad_enabled,
+                    self,
+                    None,  # skip_fp8_weight_update
+                    self.save_original_input,
+                    debug,
+                    True,  # enable_metis
+                    self.metis_tensor_history,
+                )
+            else:
+                non_tensor_args = (
+                    m_splits,
+                    self.apply_bias,
+                    is_first_microbatch,
+                    self.fp8,
+                    self.fp8_calibration,
+                    self.wgrad_store,
+                    input_quantizers,
+                    weight_quantizers,
+                    output_quantizers,
+                    grad_input_quantizers,
+                    grad_weight_quantizers,
+                    grad_output_quantizers,
+                    self.fuse_wgrad_accumulation,
+                    is_cpu_offload_enabled(),
+                    self.sequence_parallel,
+                    self.activation_dtype,
+                    is_grad_enabled,
+                    self,
+                    None,  # skip_fp8_weight_update
+                    self.save_original_input,
+                    debug,
+                )
             out = linear_fn(*autograd_ctx, inp, non_tensor_args, *weight_tensors, *bias_tensors)
 
         if self.return_bias:

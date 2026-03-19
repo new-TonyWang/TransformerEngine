@@ -47,7 +47,6 @@ std::vector<size_t> getGemmOutputShape(const NVTEShape& A_shape, const bool tran
   const size_t A1 = A_shape.data[A_shape.ndim - 1];
   const size_t B0 = product(B_shape, 0, B_shape.ndim - 1);
   const size_t B1 = B_shape.data[B_shape.ndim - 1];
-
   // Check matrix dims
   NVTE_CHECK((transa ? A1 : A0) == (transb ? B0 : B1), "Invalid matrix dimensions for GEMM (A=(",
              A0, ",", A1, "), transa=", transa, ", B=(", B0, ",", B1, "), transb=", transb, ")");
@@ -565,6 +564,115 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
                            use_split_accumulator, math_sm_count, at::cuda::getCurrentCUDAStream());
   });
   return bias;
+}
+
+std::vector<py::object> nvfp4_gemm_bf16(py::handle A, bool transa, py::handle B, bool transb, py::object D,
+                             py::handle quantizer, std::optional<DType> out_dtype, MaybeTensor bias,
+                             DType bias_type, bool grad,
+                             at::Tensor workspace, size_t workspaceSize,
+                             bool accumulate, bool use_split_accumulator,
+                             float alpha, std::optional<float> beta) {
+  using namespace transformer_engine::pytorch::detail;
+
+  // Ensure that the GEMM runs on the correct device.
+  // Assumes all tensors passed are on the same device.
+  at::cuda::CUDAGuard device_guard(workspace.device());
+
+  // Input tensors
+  NVTE_CHECK(!A.is_none(), "Tensor A has not been provided");
+  NVTE_CHECK(!B.is_none(), "Tensor B has not been provided");
+  auto none = py::none();
+  TensorWrapper A_tensor = makeTransformerEngineTensor(A, none);
+  TensorWrapper B_tensor = makeTransformerEngineTensor(B, none);
+
+  // Check tensor dimensions
+  const auto& A_shape = A_tensor.shape();
+  const auto& B_shape = B_tensor.shape();
+  const auto& D_shape = detail::getGemmOutputShape(A_shape, transa, B_shape, transb);
+
+  NVTE_CHECK(A_shape.ndim >= 1, "Tensor A needs to have at least 1 dimension");
+  NVTE_CHECK(B_shape.ndim >= 1, "Tensor B needs to have at least 1 dimension");
+
+  // Validate accumulate / beta consistency
+  if (accumulate) {
+    if (!beta) {
+      beta = 1.0f;
+    }
+  } else {
+    if (!beta) {
+      beta = 0.0f;
+    }
+    NVTE_CHECK(beta == 0.0, "Trying to use non-zero beta while not accumulating ",
+               "into D tensor. Beta has nothing to be applied to.");
+  }
+
+  DType output_dtype = out_dtype ? *out_dtype : A_tensor.dtype();
+
+  // Output tensor
+  TensorWrapper D_tensor;
+  if (D.is_none()) {
+    std::tie(D_tensor, D) = createOutputTensor(D_shape, output_dtype, quantizer);
+  } else {
+    D_tensor = makeTransformerEngineTensor(D, quantizer);
+    NVTE_CHECK(detail::checkGemmShape(D_shape, D_tensor.shape()),
+               "GEMM output has invalid dims (expected ", std::to_string(D_shape), ", got ",
+               std::to_string(D_tensor.shape()), ")");
+    if (out_dtype) {
+      NVTE_CHECK(*out_dtype == D_tensor.dtype(), "GEMM output has invalid dtype (expected ",
+                 static_cast<int>(*out_dtype), ", found ", static_cast<int>(D_tensor.dtype()), ")");
+    }
+  }
+
+  // Bias tensor
+  TensorWrapper bias_tensor;
+  MaybeTensor bias_grad = std::nullopt;
+  if (bias.has_value()) {
+    if (grad) {
+      auto opts =
+          torch::TensorOptions().dtype(GetATenDType(D_tensor.dtype())).device(torch::kCUDA);
+      bias_grad = at::empty({static_cast<int64_t>(B_shape.data[B_shape.ndim - 1])}, opts);
+      bias_tensor = makeTransformerEngineTensor(*bias_grad);
+    } else {
+      if (!bias->is_contiguous()) {
+        bias = bias->contiguous();
+      }
+      bias_tensor = makeTransformerEngineTensor(*bias);
+    }
+  }
+
+  // C tensor: used as accumulation source when accumulate=true
+  // When accumulate=true, beta=1: D = A*B + C (C points to the current D data)
+  // When accumulate=false, beta=0: D = A*B     (C is ignored, pass nullptr)
+  NVTETensor C_nvte = accumulate ? D_tensor.data() : nullptr;
+
+  auto main_stream = at::cuda::getCurrentCUDAStream();
+  if (A_tensor.numel() != 0 && B_tensor.numel() != 0) {
+    // Launch CUTLASS NVFP4 GEMM
+    NVTE_SCOPED_GIL_RELEASE({
+      nvfp4_bf16_cutlass_tensor_gemm(
+          B_tensor.data(), A_tensor.data(),
+          C_nvte, D_tensor.data(),
+          bias_tensor.data(),
+          transb, transa, grad,
+          accumulate, use_split_accumulator,
+          main_stream);
+    });
+  } else {
+    if (D_tensor.numel() != 0 && !accumulate) {
+      D_tensor.zero_(main_stream);
+    }
+    if (bias.has_value()) {
+      if (bias->numel() != 0 && grad) {
+        bias_grad->zero_();
+      }
+    }
+  }
+
+  // Pack outputs: [D, bias_grad]
+  std::vector<py::object> out;
+  out.emplace_back(std::move(D));
+  out.emplace_back(py::cast(bias_grad));
+  return out;
 }
 
 }  // namespace transformer_engine::pytorch
