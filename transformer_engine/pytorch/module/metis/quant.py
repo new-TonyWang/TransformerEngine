@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import enum
 from typing import Any, Optional, List, Union
+import os
 import torch
 
 from transformer_engine.pytorch.cpp_extensions import (
@@ -216,13 +217,27 @@ def restore_matrix(x: torch.Tensor, restore_info: RestoreInfo,restore_strategy, 
 
     return out
 
+def _trace_svd_path(path: str, tensor: torch.Tensor):
+    if os.getenv("METIS_TRACE_HYBRID_CUDAGRAPH", "0") != "1":
+        return
+    capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    print(
+        f"METIS_SVD_PATH path={path} capturing={capturing} "
+        f"shape={tuple(tensor.shape)}",
+        flush=True,
+    )
+
+
 def grad_power_iteration_svd(dy, v_prev:torch.Tensor, rank = 64, t_iter = 1,niter = 2,eps:float = 1e-8)->tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
     if v_prev is None:
+        _trace_svd_path("svd_lowrank", dy)
         u, s, v = torch.svd_lowrank(dy.to(torch.float32), q=rank, niter=niter)
         u = u.to(dy.dtype)
         s = s.to(dy.dtype)
         v = v.to(dy.dtype)
         return u,s,v
+
+    _trace_svd_path("qr_power_iteration", dy)
 
     def iter_func(dy,v):
         p = dy @ v
@@ -584,6 +599,14 @@ class MetisSvdFunction:
             res: 残差（量化后）
             restore_info: token恢复信息
         """
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if capturing and not (use_power_iteration_svd and enable_history_optimization):
+            raise RuntimeError(
+                "Metis activation SVD cannot be captured without "
+                "use_power_iteration_svd and enable_history_optimization"
+            )
+        effective_load_history = load_history or capturing
+
         # 验证TP配置
         MetisSvdFunction._validate_tp_config(tp_size, tp_strategy, token_drop_rate)
         
@@ -597,7 +620,9 @@ class MetisSvdFunction:
         # 处理token drop
         cinput, restore_info = MetisSvdFunction._prepare_input_with_token_drop(
             input_, token_drop_rate, broadcast_dim, 
-            is_backward=False, load_history=False, history_list=history_list
+            is_backward=False,
+            load_history=effective_load_history,
+            history_list=history_list,
         )
         
         # TP allgather
@@ -608,22 +633,27 @@ class MetisSvdFunction:
         # 根据不同策略执行SVD
         if use_power_iteration_svd and enable_history_optimization:
             # 使用幂迭代SVD并启用历史优化
-            if load_history and "forward_svd_history" in history_list:
-                ker, ug_sg, vg = history_list["forward_svd_history"]
+            if effective_load_history and "forward_v_history" in history_list:
+                v_prev = history_list["forward_v_history"]
             else:
-                ker, ug_sg, vg = None, None, None
+                if capturing:
+                    raise RuntimeError(
+                        "Metis CUDA Graph capture requires initialized "
+                        "forward_v_history for every Linear"
+                    )
+                v_prev = None
             
             u, s, v = grad_power_iteration_svd(
-                cinput_for_svd, vg, rank, power_iteration_time, niter
+                cinput_for_svd, v_prev, rank, power_iteration_time, niter
             )
             ug_sg = u @ torch.diag(s)
             ker = ug_sg @ v.T
-            vg = input_quantizer(v)
+            vg = v
             
-            # 只有在不加载历史或历史不存在时才存储新结果
-            if not load_history or "forward_svd_history" not in history_list:
-                # 存储bf16数据，不是量化后的数据
-                history_list["forward_svd_history"] = [ker, ug_sg, v]
+            # Anchor microbatches refresh history. Reuse microbatches only read it so
+            # CUDA Graph replay never mutates the persistent history buffers.
+            if not effective_load_history or "forward_v_history" not in history_list:
+                history_list["forward_v_history"] = v
             
         elif use_power_iteration_svd:
             # 仅使用幂迭代SVD，不使用历史优化
@@ -632,7 +662,7 @@ class MetisSvdFunction:
             )
             ug_sg = u @ torch.diag(s)
             ker = ug_sg @ v.T
-            vg = input_quantizer(v)
+            vg = v
             
         else:
             # 标准SVD
@@ -709,6 +739,17 @@ class MetisSvdFunction:
             res: 残差（量化后）
             restore_info: token恢复信息
         """
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if capturing and not (
+            use_power_iteration_svd and enable_gradient_accumulation_optimization
+        ):
+            raise RuntimeError(
+                "Metis backward SVD cannot be captured without "
+                "use_grad_power_iteration_svd and "
+                "enable_gradient_accumulation_optimization"
+            )
+        effective_load_history = load_history or capturing
+
         # 验证TP配置
         MetisSvdFunction._validate_tp_config(tp_size, tp_strategy, token_drop_rate)
         
@@ -722,7 +763,9 @@ class MetisSvdFunction:
         # 处理token drop
         cinput, restore_info = MetisSvdFunction._prepare_input_with_token_drop(
             input_, token_drop_rate, broadcast_dim,
-            is_backward=True, load_history=load_history, history_list=history_list
+            is_backward=True,
+            load_history=effective_load_history,
+            history_list=history_list,
         )
         
         if not (enable_gradient_accumulation_optimization and load_history and not use_power_iteration_svd):
@@ -737,23 +780,29 @@ class MetisSvdFunction:
         # 根据不同策略执行SVD
         if use_power_iteration_svd:
             # 使用梯度幂迭代SVD
-            if load_history:
-                ker, ug_sg, vg = history_list["backward_svd_history"]
+            if effective_load_history:
+                if "backward_v_history" not in history_list:
+                    raise RuntimeError(
+                        "Metis CUDA Graph capture/replay requires initialized "
+                        "backward_v_history for every Linear"
+                    )
+                v_prev = history_list["backward_v_history"]
             else:
-                ker, ug_sg, vg = None, None, None
+                v_prev = None
             
             u, s, v = grad_power_iteration_svd(
-                cinput_for_svd, vg, rank, power_iteration_time, niter
+                cinput_for_svd, v_prev, rank, power_iteration_time, niter
             )
             ug_sg = u @ torch.diag(s)
             ker = ug_sg @ v.T
-            vg = input_quantizer(v)
+            vg = v
             
             if restore_info is not None:
                 ker = restore_matrix(ker, restore_info, restore_strategy)
             
-            # 存储bf16数据，不是量化后的数据
-            history_list["backward_svd_history"] = [ker, ug_sg, v]
+            # Anchor microbatches refresh history. Reuse microbatches only read it.
+            if not effective_load_history or "backward_v_history" not in history_list:
+                history_list["backward_v_history"] = v
             
         elif enable_gradient_accumulation_optimization and load_history:
             # 直接加载历史数据
@@ -769,7 +818,7 @@ class MetisSvdFunction:
 
             if enable_gradient_accumulation_optimization:
                 # 这里存储的是完整的矩阵，所以拿取历史数据的时候需要切分数据
-                history_list["svd_history"] = [ker, ug_sg, vg]
+                history_list["backward_svd_history"] = [ker, ug_sg, vg]
         
         # 分割allgather的结果
         if did_allgather:
@@ -832,8 +881,8 @@ class MetisSvdFunction:
                 broadcast_dim=broadcast_dim,
                 enable_gradient_accumulation_optimization=enable_history_optimization,
                 load_history=load_history,
-                use_grad_power_iteration_svd=use_power_iteration_svd,
-                grad_power_iteration_time=power_iteration_time,
+                use_power_iteration_svd=use_power_iteration_svd,
+                power_iteration_time=power_iteration_time,
                 keep_dim=keep_dim,
                 history_list=history_list,
                 restore_strategy=restore_strategy,
